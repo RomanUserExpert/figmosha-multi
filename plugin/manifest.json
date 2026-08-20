@@ -1,0 +1,13 @@
+{
+  "name": "Figmosha Bridge",
+  "id": "figmosha-bridge-dev",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma", "figjam"],
+  "permissions": ["teamlibrary", "activeusers", "fileusers", "currentuser"],
+  "networkAccess": {
+    "allowedDomains": ["http://localhost:8787", "ws://localhost:8787"],
+    "reasoning": "Local bridge to the Figmosha CLI server running on the user's machine."
+  }
+}

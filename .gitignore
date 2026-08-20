@@ -1,0 +1,31 @@
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Runtime artifacts
+/tmp/figmosha-bridge.log
+*.log
+
+# Editor / IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Local MCP config
+.mcp.json
+
+# Our working notes - journals, plans, audits, session reports. They are about
+# how the work went, not about how the tool works, so they stay on the machine.
+# docs/ is ignored by default and product documentation is opted back in by
+# name: a new journal dropped in there is then ignored without anyone deciding.
+docs/*
+!docs/setup-new-project.md
+review/
+
+# Machine-specific notes for a copy: paths, how the bridge is started here.
+CLAUDE.local.md
+
+# A copy's project identity: it belongs to the folder it was initialized in,
+# never to the repo. The zero copy has none, which is what makes it zero.
+project.json

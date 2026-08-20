@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# `./figmosha props sel` instead of `python figmosha.py props sel`.
+#
+# Resolved from this script's own directory rather than the working one, so a
+# copy stays addressable by full path — and so a copy put on PATH keeps talking
+# to its own project rather than to whichever one you happen to stand in.
+set -e
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+PY="$ROOT/venv/bin/python"
+[ -x "$PY" ] || PY="$ROOT/venv/Scripts/python.exe"   # a venv created on Windows
+[ -x "$PY" ] || PY=$(command -v python3 || command -v python || true)
+if [ -z "$PY" ]; then
+  echo "figmosha: no python found - create the venv: python3 -m venv venv && ./venv/bin/pip install aiohttp" >&2
+  exit 127
+fi
+
+exec "$PY" "$ROOT/figmosha.py" "$@"

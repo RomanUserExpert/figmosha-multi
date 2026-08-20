@@ -1,0 +1,11 @@
+# Repo stores text as LF; Windows checkouts get CRLF via core.autocrlf.
+* text=auto
+
+# start-bridge.sh must stay LF even on Windows - bash chokes on CR.
+*.sh text eol=lf
+figmosha text eol=lf
+
+# figmosha.cmd must stay CRLF - cmd.exe mis-parses LF-only batch files.
+figmosha.cmd text eol=crlf
+
+*.png binary
