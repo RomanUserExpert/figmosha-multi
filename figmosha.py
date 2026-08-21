@@ -548,14 +548,28 @@ if (!cols.length) {
 
 // One call for the whole file rather than one per variable: a real design
 // system is ~400 of them, and asking Figma 400 times cost half a second.
-const all = await figma.variables.getLocalVariablesAsync(TYPE || undefined);
+// Unfiltered even when --type is given, so that the duplicate count below sees
+// every collection a name lives in; filtering here instead costs nothing.
+const everything = await figma.variables.getLocalVariablesAsync();
+for (const v of everything) localNames[v.id] = v.name;
+
+// A themed library holds every primitive twice — once per theme collection —
+// so a bare name is not something you can bind by. Those rows are printed
+// qualified, which is the form h.bF/h.bN take back; the rest stay short.
+const seenIn = {};
+for (const v of everything) {
+  (seenIn[v.name] = seenIn[v.name] || {})[v.variableCollectionId] = 1;
+}
+const ambiguous = (v) => Object.keys(seenIn[v.name]).length > 1;
+
+const all = TYPE ? everything.filter((v) => v.resolvedType === TYPE) : everything;
 const byCollection = {};
 for (const v of all) {
   (byCollection[v.variableCollectionId] = byCollection[v.variableCollectionId] || []).push(v);
-  localNames[v.id] = v.name;
 }
 
 let shown = 0;
+let qualified = 0;
 for (const col of cols) {
   const picked = (byCollection[col.id] || []).filter(
     (v) => !FILTER || v.name.toLowerCase().indexOf(FILTER) !== -1);
@@ -589,13 +603,19 @@ for (const col of cols) {
     continue;
   }
 
-  const width = Math.min(38, Math.max.apply(null, picked.map((v) => v.name.length)) + 2);
+  const label = (v) => ambiguous(v) ? col.name + '/' + v.name : v.name;
+  const width = Math.min(38, Math.max.apply(null, picked.map((v) => label(v).length)) + 2);
   for (const v of picked) {
     if (shown++ >= __MAX__) { out.push('  … stopped at __MAX__ rows — narrow the filter'); break; }
+    if (ambiguous(v)) qualified++;
     const cells = [];
     for (const m of col.modes) cells.push(await value(v, m.modeId));
-    out.push('  ' + pad(v.name, width) + cells.join('   '));
+    out.push('  ' + pad(label(v), width) + cells.join('   '));
   }
+}
+if (qualified) {
+  out.push('(' + qualified + ' name(s) printed as Collection/name live in more than ' +
+    'one collection — bind by that full form, a bare name is ambiguous)');
 }
 return out.join('\n');
 """

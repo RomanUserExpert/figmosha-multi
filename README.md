@@ -49,7 +49,7 @@ Solid arrows carry the request, dotted ones the response.
 
 - **One Python file** server + **one Python file** CLI, ~500 lines total. No npm. No frameworks.
 - **Custom Figma plugin**, ~250 lines (JS + HTML). Imported in dev mode — no publishing.
-- **20 helpers** baked into the plugin runtime as `h.*` so scripts stay short and safe (`h.bF`, `h.setText`, `h.withFonts`, `h.frame`, `h.hex`, `h.sel`, …).
+- **22 helpers** baked into the plugin runtime as `h.*` so scripts stay short and safe (`h.bF`, `h.setText`, `h.withFonts`, `h.frame`, `h.hex`, `h.sel`, …).
 - **11 high-level CLI subcommands** for common ops (`doctor`, `sel`, `tree`, `find`, `text`, `variant`, `clone`, `rm`, `icomp`, …).
 - **`figmosha doctor`** walks the whole chain — bridge, plugin, round trip, which file is open — and names the fix at whichever link is broken.
 - **Smart error hints** in responses — when a script fails with a known-pattern error, the response includes a `hint` field telling you how to fix it.
@@ -313,9 +313,10 @@ new Function("figma", "print", "h", `return (async () => { <YOUR CODE> })();`)(f
 
 | Helper | Use |
 |---|---|
-| `await h.bF(node, idx, varOrId)` | Bind fill paint at `idx` to variable (handles frozen-array dance) |
-| `await h.bS(node, idx, varOrId)` | Bind stroke paint to variable |
-| `await h.bN(node, prop, varOrId)` | Bind numeric prop (radius, padding, size, itemSpacing, …) |
+| `await h.bF(node, idx, var)` | Bind fill paint at `idx` to a variable (handles frozen-array dance) |
+| `await h.bS(node, idx, var)` | Bind stroke paint to a variable |
+| `await h.bN(node, prop, var)` | Bind numeric prop (radius, padding, size, itemSpacing, …) |
+| `await h.applyStyle(node, kind, name)` | Apply a style — `fill`, `stroke`, `text`, `effect`, `grid` |
 | `h.findByName(root, name)` | First descendant with exact name |
 | `h.findAllByName(root, name)` | All descendants with exact name |
 | `h.dumpTree(node, {maxDepth, showSize, showText, showLayout})` | Indented tree string |
@@ -330,11 +331,18 @@ new Function("figma", "print", "h", `return (async () => { <YOUR CODE> })();`)(f
 | `h.solid("#1a2b3c", opacity?)` | Ready-to-assign paint array |
 | `h.frame(parent, opts)` | Frame with auto-layout applied in the right order |
 | `await h.node(id)` | Shorthand for `figma.getNodeByIdAsync(id)` |
-| `await h.var_(idOrKey)` | Resolve variable from instance, local id, or library key |
+| `await h.var_(name)` | Resolve a variable by name, local id, or library key (`null` if there is none) |
+| `await h.style_(kind, name)` | Resolve a style the same way |
 | `await h.importComp(key)` | `figma.importComponentByKeyAsync(key)` |
 | `await h.importVar(key)` | `figma.variables.importVariableByKeyAsync(key)` |
 
 Compared to inlined boilerplate, helpers reduce a typical script by ~60–70% and avoid common gotchas (frozen `node.fills`, missing `loadFontAsync`, deprecated sync `getVariableById`).
+
+#### Addressing a variable or style by name
+
+Everywhere a helper takes `var` or `name`, it accepts what `figmosha vars` and `figmosha styles` print — the name — as well as a local id (`VariableID:…`, `S:…`) or a library key. Names are matched most specific first: exact, then ignoring case, then qualified with the collection (`Semantics/color/bg/default`), then as a suffix on a `/` boundary (`bg/default` finds `color/bg/default`, and never `bg/default-alt`).
+
+A name that matches more than one variable **throws with the candidates listed** rather than picking one. That case is not rare: a themed library has every primitive twice, once per theme collection. `figmosha vars` prints exactly those names qualified, so the form it shows is the form that resolves.
 
 ### Error hints
 

@@ -76,31 +76,186 @@ function asText(value, logs) {
 // same `print()` the user's code gets. No-op outside an exec.
 let CURRENT_PRINT = () => {};
 
-async function resolveVar(varOrId) {
+// Read once per exec, dropped in the same `finally` as CURRENT_PRINT. A design
+// system is ~400 variables, so binding five names in one script would
+// otherwise ask Figma for the whole list five times. Dropped rather than kept,
+// because a script that creates variables must not see a stale list on the
+// next call.
+let VAR_CACHE = null;
+let STYLE_CACHE = null;
+
+function clearExecCaches() {
+  VAR_CACHE = null;
+  STYLE_CACHE = null;
+}
+
+// A library key is 32+ hex characters. A local id is "VariableID:1:23" or
+// "S:1:23"; a name looks like neither, and checking the shape up front is what
+// keeps a name out of importVariableByKeyAsync — a network round trip that can
+// only fail.
+const LIBRARY_KEY = /^[0-9a-f]{32,}$/i;
+
+// A snapshot of {name, group}, not the variables themselves. Every property
+// read on a Figma object crosses into the engine — measured at ~14 ms to read
+// `name` across 438 variables — so a ladder of four rungs over the live list
+// would pay that toll four times, on every single resolve. Read once, match in
+// plain JS, hand back the original through `ref`.
+async function localVars() {
+  if (!VAR_CACHE) {
+    const cols = await figma.variables.getLocalVariableCollectionsAsync();
+    const names = {};
+    for (const c of cols) names[c.id] = c.name;
+    const vars = await figma.variables.getLocalVariablesAsync();
+    VAR_CACHE = vars.map((v) => ({
+      name: v.name,
+      group: names[v.variableCollectionId] || "?",
+      ref: v,
+    }));
+  }
+  return VAR_CACHE;
+}
+
+// Name lookup, most specific rung first. The first rung that matches anything
+// wins outright: an exact hit in one collection must not be diluted by a
+// suffix hit in another.
+//
+//   color/bg/default            exact, case-sensitive
+//   Color/BG/Default            exact, ignoring case
+//   Semantics/color/bg/default  qualified with the group (collection) name
+//   bg/default                  suffix, on a "/" boundary only
+//
+// That boundary is the whole point of the last rung: "default" must not match
+// "bg/default-alt".
+function matchByName(items, query, withGroup) {
+  const q = String(query).trim();
+  const ql = q.toLowerCase();
+  const rungs = [
+    (i) => i.name === q,
+    (i) => i.name.toLowerCase() === ql,
+  ];
+  if (withGroup) {
+    rungs.push((i) => (i.group + "/" + i.name).toLowerCase() === ql);
+  }
+  rungs.push((i) => {
+    const n = i.name.toLowerCase();
+    return n.length > ql.length + 1 && n.slice(-(ql.length + 1)) === "/" + ql;
+  });
+  for (const rung of rungs) {
+    const hit = items.filter(rung);
+    if (hit.length) return hit;
+  }
+  return [];
+}
+
+// Ambiguity is an error rather than a guess on purpose: in a themed library
+// every primitive exists twice, and binding the wrong one of the pair stays
+// invisible until someone opens the file in the other mode.
+function ambiguous(who, query, labels) {
+  const shown = labels.slice(0, 5);
+  return new Error(
+    who + ": " + JSON.stringify(query) + " matches " + labels.length +
+    " — qualify it:\n  " + shown.join("\n  ") +
+    (labels.length > shown.length
+      ? "\n  … " + (labels.length - shown.length) + " more" : "")
+  );
+}
+
+// The narrowest filter that still stands a chance of listing what was meant:
+// the last segment is the part the caller is surest about.
+function lastSegment(name) {
+  const parts = String(name).split("/");
+  return parts[parts.length - 1] || String(name);
+}
+
+// `who` is the helper this runs on behalf of. Given, a miss becomes an error
+// naming where to look; omitted (h.var_), a miss is null and the caller
+// decides. An ambiguous *name* throws either way.
+async function resolveVar(varOrId, who) {
   if (varOrId == null) return null;
   if (typeof varOrId !== "string") return varOrId;
 
-  // Local variables are addressed as "VariableID:1:23"; anything else is a
-  // library key, which has to be imported rather than looked up.
   if (varOrId.indexOf("VariableID:") === 0) {
-    return await figma.variables.getVariableByIdAsync(varOrId);
+    const byId = await figma.variables.getVariableByIdAsync(varOrId);
+    if (byId || !who) return byId;
+    throw new Error(who + ": no variable with id " + varOrId);
   }
-  // A library key is not a well-formed id, and getVariableByIdAsync rejects
-  // those by throwing rather than returning null — so this has to be guarded,
-  // otherwise the import below is unreachable for the very case it exists for.
-  let local = null;
-  try {
-    local = await figma.variables.getVariableByIdAsync(varOrId);
-  } catch (e) {
-    local = null;
-  }
-  if (local) return local;
 
-  try {
-    return await figma.variables.importVariableByKeyAsync(varOrId);
-  } catch (e) {
-    return null;
+  if (LIBRARY_KEY.test(varOrId)) {
+    try {
+      return await figma.variables.importVariableByKeyAsync(varOrId);
+    } catch (e) {
+      if (!who) return null;
+      throw new Error(who + ": no library variable with key " + varOrId +
+        " — list them: figmosha vars --library");
+    }
   }
+
+  const hits = matchByName(await localVars(), varOrId, true);
+  if (hits.length === 1) return hits[0].ref;
+  if (hits.length > 1) {
+    throw ambiguous(who || "h.var_", varOrId,
+      hits.map((i) => i.group + "/" + i.name));
+  }
+  if (!who) return null;
+  throw new Error(
+    who + ": no variable named " + JSON.stringify(varOrId) +
+    " — see what exists: figmosha vars " + lastSegment(varOrId));
+}
+
+// Styles have no collections, so the qualified rung does not apply. Fill and
+// stroke share one list, because Figma has one kind of paint style.
+const STYLE_KINDS = {
+  fill:   { list: "getLocalPaintStylesAsync",  apply: "setFillStyleIdAsync" },
+  stroke: { list: "getLocalPaintStylesAsync",  apply: "setStrokeStyleIdAsync" },
+  text:   { list: "getLocalTextStylesAsync",   apply: "setTextStyleIdAsync" },
+  effect: { list: "getLocalEffectStylesAsync", apply: "setEffectStyleIdAsync" },
+  grid:   { list: "getLocalGridStylesAsync",   apply: "setGridStyleIdAsync" },
+};
+
+function styleKind(kind, who) {
+  const spec = STYLE_KINDS[kind];
+  if (!spec) {
+    throw new Error(who + ": unknown style kind " + JSON.stringify(kind) +
+      " — one of: " + Object.keys(STYLE_KINDS).join(", "));
+  }
+  return spec;
+}
+
+async function localStyles(spec) {
+  if (!STYLE_CACHE) STYLE_CACHE = {};
+  if (!STYLE_CACHE[spec.list]) {
+    const list = await figma[spec.list]();
+    STYLE_CACHE[spec.list] = list.map((st) => ({ name: st.name, ref: st }));
+  }
+  return STYLE_CACHE[spec.list];
+}
+
+async function resolveStyle(kind, nameOrId, who) {
+  who = who || "h.applyStyle";
+  const spec = styleKind(kind, who);
+  if (nameOrId == null) return null;
+  if (typeof nameOrId !== "string") return nameOrId;
+
+  if (nameOrId.indexOf("S:") === 0) {
+    const byId = await figma.getStyleByIdAsync(nameOrId);
+    if (byId) return byId;
+    throw new Error(who + ": no style with id " + nameOrId);
+  }
+
+  if (LIBRARY_KEY.test(nameOrId)) {
+    try {
+      return await figma.importStyleByKeyAsync(nameOrId);
+    } catch (e) {
+      throw new Error(who + ": no library style with key " + nameOrId);
+    }
+  }
+
+  const hits = matchByName(await localStyles(spec), nameOrId, false);
+  if (hits.length === 1) return hits[0].ref;
+  if (hits.length > 1) throw ambiguous(who, nameOrId, hits.map((i) => i.name));
+  throw new Error(
+    who + ": no " + kind + " style named " + JSON.stringify(nameOrId) +
+    " — see what exists: figmosha styles " + lastSegment(nameOrId));
 }
 
 // "#1a2b3c" / "1a2b3c" / "#f00" -> {r,g,b} in Figma's 0..1 range.
@@ -148,10 +303,11 @@ function copyPaints(node, prop, who) {
 }
 
 const HELPERS = {
-  // Bind fill paint at index to a variable (id or instance)
+  // Bind fill paint at index to a variable, given as a token name, a local id,
+  // or a library key
   async bF(node, idx, varOrId) {
-    const v = await resolveVar(varOrId);
-    if (!v) throw new Error("h.bF: variable not found: " + varOrId);
+    const v = await resolveVar(varOrId, "h.bF");
+    if (!v) throw new Error("h.bF: no variable given");
     const f = copyPaints(node, "fills", "h.bF");
     if (!f[idx]) throw new Error("h.bF: '" + node.name + "' has no fill at index " + idx);
     f[idx] = figma.variables.setBoundVariableForPaint(f[idx], "color", v);
@@ -161,8 +317,8 @@ const HELPERS = {
 
   // Bind stroke paint at index
   async bS(node, idx, varOrId) {
-    const v = await resolveVar(varOrId);
-    if (!v) throw new Error("h.bS: variable not found: " + varOrId);
+    const v = await resolveVar(varOrId, "h.bS");
+    if (!v) throw new Error("h.bS: no variable given");
     const s = copyPaints(node, "strokes", "h.bS");
     if (!s[idx]) throw new Error("h.bS: '" + node.name + "' has no stroke at index " + idx);
     s[idx] = figma.variables.setBoundVariableForPaint(s[idx], "color", v);
@@ -172,8 +328,8 @@ const HELPERS = {
 
   // Bind numeric property (radii, padding, sizes, itemSpacing, etc.)
   async bN(node, prop, varOrId) {
-    const v = await resolveVar(varOrId);
-    if (!v) throw new Error("h.bN: variable not found: " + varOrId);
+    const v = await resolveVar(varOrId, "h.bN");
+    if (!v) throw new Error("h.bN: no variable given");
     node.setBoundVariable(prop, v);
     return v;
   },
@@ -361,9 +517,24 @@ const HELPERS = {
     return await figma.getNodeByIdAsync(idOrAlias);
   },
 
+  // Apply a local or library style by name, id, or key. kind is one of
+  // fill / stroke / text / effect / grid.
+  async applyStyle(node, kind, nameOrId) {
+    const spec = styleKind(kind, "h.applyStyle");
+    const style = await resolveStyle(kind, nameOrId, "h.applyStyle");
+    if (!style) throw new Error("h.applyStyle: no style given");
+    if (typeof node[spec.apply] !== "function") {
+      throw new Error("h.applyStyle: '" + node.name + "' [" + node.type +
+        "] takes no " + kind + " style");
+    }
+    await node[spec.apply](style.id);
+    return style;
+  },
+
   // Quick async accessors
   async node(id)      { return await figma.getNodeByIdAsync(id); },
   async var_(idOrKey) { return await resolveVar(idOrKey); },
+  async style_(kind, nameOrId) { return await resolveStyle(kind, nameOrId); },
   async importComp(key) { return await figma.importComponentByKeyAsync(key); },
   async importVar(key)  { return await figma.variables.importVariableByKeyAsync(key); },
 };
@@ -427,5 +598,6 @@ figma.ui.onmessage = async (msg) => {
     });
   } finally {
     CURRENT_PRINT = () => {};
+    clearExecCaches();
   }
 };

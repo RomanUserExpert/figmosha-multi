@@ -98,7 +98,10 @@ don't ask them to find an id by hand.
 ## Helpers (`h.*`, available in every exec)
 
 ```
-h.bF(node, idx, var) · h.bS(node, idx, var) · h.bN(node, prop, var)  bind fill / stroke / number to a variable
+h.bF(node, idx, var) · h.bS(node, idx, var) · h.bN(node, prop, var)  bind fill / stroke / number
+     var — token name («space/md», «Semantics/color/bg/default»), local id, or library key
+     an ambiguous name throws with the candidates; it never picks one
+h.applyStyle(node, kind, name)  kind: fill | stroke | text | effect | grid
 h.findByName(root, name) · h.findAllByName(root, name)
 h.dumpTree(node, {maxDepth, showSize, showText, showLayout})         indented tree string
 h.withFonts(root, fn) · h.setText(node, text)                        font loading, done right
