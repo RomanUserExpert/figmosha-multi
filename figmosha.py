@@ -82,7 +82,7 @@ SESSION = DEFAULT_SESSION
 KNOWN_CMDS = {
     "exec", "status", "doctor", "sel", "tree", "find", "text", "variant",
     "clone", "rm", "import-component", "icomp", "init", "sessions", "props",
-    "vars", "styles", "update", "set", "bind",
+    "vars", "styles", "update", "set", "bind", "overrides", "where",
 }
 
 # Options that belong to the parser itself rather than to a subcommand, and
@@ -287,6 +287,95 @@ NODE_FIELDS_JS = (
 #
 # Defaults are not printed unless --all: `constraints MIN/MIN`, `opacity 1` and
 # `rotation 0` are on every node in the file and mean nothing.
+OVERRIDES_JS = r"""
+const n = await h.resolve(__ID__);
+if (!n) throw new Error('node not found: ' + __ID__);
+if (n.type !== 'INSTANCE') {
+  throw new Error('not an INSTANCE (got ' + n.type + ') — overrides only exist on instances');
+}
+
+const pad = (s, w) => (s + '                                ').slice(0, Math.max(w, s.length));
+const main = await n.getMainComponentAsync();
+const set = main && main.parent && main.parent.type === 'COMPONENT_SET' ? main.parent : null;
+
+// Variant values first: half the "why does this look different" questions end
+// there, before any override is involved.
+const props = [];
+for (const k in (n.componentProperties || {})) {
+  const p = n.componentProperties[k];
+  const value = (p && p.value !== undefined) ? p.value : p;
+  props.push(k.split('#')[0] + '=' + value);
+}
+
+// A variant's own name is its property list ("Mode=Day"), which the row
+// already carries — so the set's name is the useful half, not both.
+const out = [n.id + '  ' +
+  (set ? set.name : (main ? main.name : 'detached')) +
+  (props.length ? '  ·  ' + props.join(', ') : '')];
+
+const list = n.overrides || [];
+if (!list.length) {
+  out.push('  nothing overridden');
+  return out.join('\n');
+}
+
+for (const o of list) {
+  const fields = (o.overriddenFields || []).join(', ');
+  // The first entry is usually the instance itself; saying so beats printing
+  // its name a second time and leaving the reader to match ids.
+  let name = o.id === n.id ? '(this instance)' : o.id;
+  if (o.id !== n.id) {
+    const inner = await figma.getNodeByIdAsync(o.id);
+    if (inner) name = inner.name;
+  }
+  out.push('  ' + pad(name, 18) + pad(o.id, 22) + fields);
+}
+return out.join('\n');
+"""
+
+
+WHERE_JS = r"""
+let n = await h.resolve(__ID__);
+if (!n) throw new Error('node not found: ' + __ID__);
+
+// Up rather than down: "why did this move" is answered by the ancestors, and
+// each one contributes its own sizing to the answer.
+const chain = [];
+while (n) {
+  chain.unshift(n);
+  if (n.type === 'PAGE' || n.type === 'DOCUMENT') break;
+  n = n.parent;
+}
+
+const num = (v) => (v === undefined || v === null || typeof v === 'symbol')
+  ? '?' : String(Math.round(v));
+const pad = (s, w) => (s + '                                ').slice(0, Math.max(w, s.length));
+
+const out = [];
+for (let i = 0; i < chain.length; i++) {
+  const node = chain[i];
+  if (node.type === 'PAGE' || node.type === 'DOCUMENT') {
+    out.push(node.type === 'PAGE' ? 'Page «' + node.name + '»' : node.name);
+    continue;
+  }
+  const indent = i ? ' '.repeat(2 * i - 1) + '└ ' : '';
+  // Ids inside an instance are long (I10:239;88:9705), and a column that
+  // collides with the next one is worse than a wide one.
+  let line = indent + pad(node.name, Math.max(2, 22 - 2 * i)) + pad(node.id, 17) + node.type;
+  if (node.width !== undefined) line += '  ' + num(node.width) + '×' + num(node.height);
+  // Sizing is the reason the question gets asked, so it goes on every row that
+  // has it, not only the last.
+  if (node.layoutSizingHorizontal) {
+    line += '  H=' + node.layoutSizingHorizontal + ' V=' + node.layoutSizingVertical;
+  }
+  if (node.layoutGrow) line += '  grow:' + node.layoutGrow;
+  if (node.layoutMode && node.layoutMode !== 'NONE') line += '  [' + node.layoutMode[0] + ']';
+  out.push(line);
+}
+return out.join('\n');
+"""
+
+
 MUTATE_JS = r"""
 const MODE = __MODE__;          // 'set' — literal values; 'bind' — token names
 const DRY = __DRY__;
@@ -1506,6 +1595,16 @@ def cmd_bind(args):
     return _mutate(args, "bind")
 
 
+def cmd_overrides(args):
+    code = OVERRIDES_JS.replace("__ID__", json.dumps(args.node_id))
+    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+
+
+def cmd_where(args):
+    code = WHERE_JS.replace("__ID__", json.dumps(args.node_id))
+    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+
+
 def cmd_variant(args):
     props = {}
     for kv in args.props:
@@ -1687,6 +1786,15 @@ def build_parser():
         p.add_argument("--dry-run", action="store_true",
                        help="print the same diff without writing anything")
 
+    p_overrides = sub.add_parser("overrides",
+                                 help="what an instance overrides against its main component")
+    _add_common_flags(p_overrides)
+    p_overrides.add_argument("node_id", help="instance id, or `sel`")
+
+    p_where = sub.add_parser("where", help="path from the page down to a node, with sizing")
+    _add_common_flags(p_where)
+    p_where.add_argument("node_id", help="node id, or `sel`")
+
     p_variant = sub.add_parser("variant")
     _add_common_flags(p_variant)
     p_variant.add_argument("node_id")
@@ -1754,6 +1862,8 @@ def main():
         "tree": cmd_tree,
         "find": cmd_find,
         "set": cmd_set,
+        "overrides": cmd_overrides,
+        "where": cmd_where,
         "bind": cmd_bind,
         "text": cmd_text,
         "variant": cmd_variant,

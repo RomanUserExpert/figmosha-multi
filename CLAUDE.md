@@ -78,6 +78,8 @@ Rules that follow from how Figma works, not from Figmosha:
 | `figmosha sel` | What the user has selected — one line per node |
 | `figmosha vars [filter] [--type T]` | Which variables exist and what they resolve to, per mode. No filter — a map of collections, not a dump of the file. `--library` for collections this file consumes |
 | `figmosha styles [filter]` | Local paint / text / effect / grid styles with their values |
+| `figmosha where <id>` | Path from the page down, with each ancestor's size and sizing mode — the answer to «why did this move» |
+| `figmosha overrides <id>` | What an instance overrides against its main component, layer by layer |
 | `figmosha props <id> [--all] [-c]` | Everything set on one node, with variables and styles **by name** — the fastest answer to "is this bound or hardcoded?". `-c` adds a row per child with its sizing, for "why did this move" |
 | `figmosha tree <id> [--depth N] [--layout]` | Explore structure. **Depth 3 by default**; a cut branch says `… +N deeper`, and three or more identical siblings collapse into one row (`--no-collapse` to see them all) |
 | `figmosha find <id> name=Button` | Locate by exact name (`name~Btn` = substring) |

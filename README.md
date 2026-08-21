@@ -287,6 +287,11 @@ python figmosha.py find 1:23 name=Button         # find by exact name
 python figmosha.py find 1:23 name~Btn            # substring name match
 python figmosha.py find 1:23 type=INSTANCE       # filter by type
 python figmosha.py find 1:23 text~hello          # find TEXT containing "hello"
+python figmosha.py where 1:23                     # path from the page down, sizing on every row
+python figmosha.py overrides 1:30                # what an instance overrides, layer by layer
+python figmosha.py set 1:23 gap=16 fill=#f5f5f5  # literal values, before → after
+python figmosha.py set sel radius=8 --dry-run    # same table, nothing written
+python figmosha.py bind 1:23 gap=space/md        # bind the same keys to variables by name
 python figmosha.py text 1:25 "new content"       # set TEXT chars (autoloads fonts)
 python figmosha.py variant 1:30 "Property 1=Default"
 python figmosha.py clone 1:23 --right --gap 100  # clone adjacent

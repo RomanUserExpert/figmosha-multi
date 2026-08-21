@@ -469,6 +469,101 @@ def test_exec_without_set_is_untouched(monkeypatch):
     figmosha.cmd_exec(parse("exec", "return 1;"))
     assert seen["code"] == "return 1;"
 
+
+# ─── overrides / where ────────────────────────────────────────────────────
+
+TREE_STUB = """
+const page = {id:'0:1', name:'stuff', type:'PAGE'};
+const frame = {id:'10:238', name:'Fluent Icons', type:'FRAME', width:1440, height:2150,
+               parent: page, layoutSizingHorizontal:'FIXED', layoutSizingVertical:'FIXED'};
+const inner = {id:'I10:239;88:9705', name:'Title', type:'TEXT', width:298, height:56};
+const main = {id:'88:1', name:'Mode=Day', parent:{type:'COMPONENT_SET', name:'Header_Stylesheet'}};
+const inst = {
+  id:'10:239', name:'Headline', type:'INSTANCE', width:1440, height:148,
+  parent: frame, layoutMode:'VERTICAL',
+  layoutSizingHorizontal:'FIXED', layoutSizingVertical:'HUG',
+  componentProperties: {'Mode#8:0': {value:'Day', type:'VARIANT'}},
+  overrides: [
+    {id:'10:239', overriddenFields:['fillStyleId','name']},
+    {id:'I10:239;88:9705', overriddenFields:['characters']},
+  ],
+  getMainComponentAsync: async () => main,
+};
+const plain = {id:'10:240', name:'Just a frame', type:'FRAME', width:10, height:10, parent: page};
+const bare = Object.assign({}, inst, {id:'10:241', overrides: [],
+  getMainComponentAsync: async () => main});
+const all = [page, frame, inst, inner, plain, bare];
+const figma = {
+  currentPage: page,
+  getNodeByIdAsync: async (id) => all.find(n => n.id === id) || null,
+};
+const h = { resolve: async (x) => x === 'page' ? page : await figma.getNodeByIdAsync(x) };
+"""
+
+
+def run_tree_js(code):
+    program = (TREE_STUB + "(async () => {" + code + "})()"
+               ".then(v => console.log(v))"
+               ".catch(e => { console.log('THREW: ' + e.message); });")
+    out = subprocess.run([NODE, "-e", program], capture_output=True, text=True,
+                         encoding="utf-8")
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip()
+
+
+def tree_cmd(monkeypatch, fn, *argv):
+    seen = captured(monkeypatch)
+    fn(parse(*argv))
+    return run_tree_js(seen["code"])
+
+
+@needs_node
+def test_overrides_lists_fields_with_layer_names(monkeypatch):
+    out = tree_cmd(monkeypatch, figmosha.cmd_overrides, "overrides", "10:239")
+    assert "Header_Stylesheet" in out and "Mode=Day" in out
+    assert "(this instance)" in out and "fillStyleId" in out
+    assert "Title" in out and "characters" in out
+
+
+@needs_node
+def test_overrides_names_the_set_once(monkeypatch):
+    """The variant's own name is its property list, so printing both is noise."""
+    out = tree_cmd(monkeypatch, figmosha.cmd_overrides, "overrides", "10:239")
+    assert out.splitlines()[0].count("Mode=Day") == 1
+
+
+@needs_node
+def test_overrides_says_so_when_there_are_none(monkeypatch):
+    out = tree_cmd(monkeypatch, figmosha.cmd_overrides, "overrides", "10:241")
+    assert "nothing overridden" in out
+
+
+@needs_node
+def test_overrides_refuses_a_node_that_is_not_an_instance(monkeypatch):
+    out = tree_cmd(monkeypatch, figmosha.cmd_overrides, "overrides", "10:240")
+    assert "THREW" in out and "not an INSTANCE" in out
+
+
+@needs_node
+def test_where_walks_up_to_the_page(monkeypatch):
+    out = tree_cmd(monkeypatch, figmosha.cmd_where, "where", "10:239")
+    lines = out.splitlines()
+    assert lines[0] == "Page «stuff»"
+    assert "Fluent Icons" in lines[1] and "Headline" in lines[2]
+
+
+@needs_node
+def test_where_carries_sizing_on_every_row(monkeypatch):
+    """Sizing is why the question gets asked, so an ancestor must show its own."""
+    out = tree_cmd(monkeypatch, figmosha.cmd_where, "where", "10:239")
+    assert out.count("H=FIXED") == 2 and "V=HUG" in out
+
+
+@needs_node
+def test_where_on_the_page_is_one_line(monkeypatch):
+    out = tree_cmd(monkeypatch, figmosha.cmd_where, "where", "page")
+    assert out == "Page «stuff»"
+
 # ─── doctor ───────────────────────────────────────────────────────────────
 
 def test_doctor_reads_the_file_it_reports(monkeypatch, capsys):
