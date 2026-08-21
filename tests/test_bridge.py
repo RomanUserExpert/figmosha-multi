@@ -9,6 +9,7 @@ registry, the handover within a session, and the origin/host guard.
 """
 
 import asyncio
+import time
 import json
 import sys
 from pathlib import Path
@@ -636,3 +637,67 @@ def test_find_hint(error_text, expected):
         assert hint is None
     else:
         assert expected in hint
+
+
+# ─── the queue counter, and how the incumbent is asked ────────────────────
+
+def test_queued_comes_back_down_when_a_caller_walks_away():
+    """Ctrl-C mid-wait raises CancelledError inside /exec.
+
+    The count it leaves behind is what `sessions` reports and what the 504 hint
+    tells the next caller to look at, so a leak there misinforms every request
+    that follows for as long as the bridge runs.
+    """
+    async def go():
+        c = await make_client()
+        async with FakePlugin(c, reply=lambda code: {"text": "slow"}) as p:
+            # Hold the session lock so the second caller has to queue.
+            session = next(iter(bridge.SESSIONS.values()))
+            await session.lock.acquire()
+
+            waiting = asyncio.create_task(
+                c.post("/exec", json={"code": "return 1", "timeout": 30}))
+            await asyncio.sleep(0.2)
+            assert session.queued == 1
+
+            waiting.cancel()
+            try:
+                await waiting
+            except asyncio.CancelledError:
+                pass
+            await asyncio.sleep(0.1)
+            assert session.queued == 0
+
+            session.lock.release()
+        await c.close()
+    run(go())
+
+
+def test_incumbent_is_answered_by_the_pong_not_by_a_poll():
+    """A reconnecting plugin waits on this, so it must not cost a poll tick."""
+    async def go():
+        c = await make_client()
+        async with FakePlugin(c, sid="s1", file="One"):
+            session = bridge.SESSIONS["s1"]
+            start = time.monotonic()
+            assert await bridge._incumbent_answers(session) is True
+            elapsed = time.monotonic() - start
+            # The old loop slept 50 ms before its first look; anything under
+            # that shows the future is being resolved by the pong itself.
+            assert elapsed < 0.04, elapsed
+            assert session.pong_waiters == []
+        await c.close()
+    run(go())
+
+
+def test_a_silent_plugin_still_times_out():
+    """The fast path must not make a dead socket look alive."""
+    async def go():
+        c = await make_client()
+        async with FakePlugin(c, sid="s1", answer_ping=False) as p:
+            p.go_silent()
+            session = bridge.SESSIONS["s1"]
+            assert await bridge._incumbent_answers(session, timeout=0.2) is False
+            assert session.pong_waiters == []
+        await c.close()
+    run(go())

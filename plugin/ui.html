@@ -60,7 +60,7 @@ function requestIdentity() {
 }
 
 function helloMessage() {
-  const hello = { type: "hello", version: "2.3" };
+  const hello = { type: "hello", version: "2.4" };
   if (me) { hello.sid = me.sid; hello.file = me.file; hello.page = me.page; }
   return hello;
 }

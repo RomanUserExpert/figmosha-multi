@@ -564,6 +564,44 @@ def test_where_on_the_page_is_one_line(monkeypatch):
     out = tree_cmd(monkeypatch, figmosha.cmd_where, "where", "page")
     assert out == "Page «stuff»"
 
+
+# ─── the vars cap ─────────────────────────────────────────────────────────
+
+@needs_node
+def test_vars_warns_about_the_cap_once_per_command(monkeypatch):
+    """`shown` counts the whole file, but `break` only left the inner loop —
+    so a file with several collections repeated the warning per collection."""
+    seen = captured(monkeypatch)
+    figmosha.cmd_vars(parse("vars", "color"))
+
+    stub = """
+    const cols = [];
+    const vars = [];
+    for (let c = 0; c < 7; c++) {
+      cols.push({id: 'C' + c, name: 'Col' + c, modes: [{modeId: 'm', name: 'Mode 1'}],
+                 variableIds: []});
+      for (let i = 0; i < 60; i++) {
+        vars.push({id: 'V' + c + '_' + i, name: 'color/x' + c + '/' + i,
+                   resolvedType: 'FLOAT', variableCollectionId: 'C' + c,
+                   valuesByMode: {m: i}});
+      }
+    }
+    cols.forEach(c => { c.variableIds = vars.filter(v => v.variableCollectionId === c.id)
+                                            .map(v => v.id); });
+    const figma = { variables: {
+      getLocalVariableCollectionsAsync: async () => cols,
+      getLocalVariablesAsync: async () => vars,
+      getVariableByIdAsync: async (id) => vars.find(v => v.id === id) || null,
+    }};
+    """
+    program = (stub + "(async () => {" + seen["code"] + "})()"
+               ".then(v => console.log(v))"
+               ".catch(e => { console.error(e.message); process.exit(1); });")
+    out = subprocess.run([NODE, "-e", program], capture_output=True, text=True,
+                         encoding="utf-8")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.count("stopped at") == 1, out.stdout[-400:]
+
 # ─── doctor ───────────────────────────────────────────────────────────────
 
 def test_doctor_reads_the_file_it_reports(monkeypatch, capsys):

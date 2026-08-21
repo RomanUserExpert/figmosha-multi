@@ -103,17 +103,41 @@ for (const n of flat) {
   }
 }
 
-const trim = (arr) => ({ count: arr.length, rows: arr.slice(0, CAP) });
+// ── output ───────────────────────────────────────────────────────────────
+// Rows, not nested objects: the same findings cost roughly a third as much,
+// and the reader is an agent paying per character. --raw still exists on the
+// CLI for anything that wants structure.
+const pad = (s, w) => (String(s) + "                                        ")
+  .slice(0, Math.max(w, String(s).length));
+const at = (r) => pad(r.id, 12) + pad(r.name + " [" + r.type + "]", 30);
 
-return {
-  root: { id: root.id, name: root.name, type: root.type },
-  scale: scale,
-  totals: { visited: visited, instances: instanceCount },
-  rawFills: trim(rawFills),
-  rawStrokes: trim(rawStrokes),
-  rawText: trim(rawText),
-  rawRadius: trim(rawRadius),
-  offScale: trim(offScale),
-  detached: trim(detached),
-  instanceUsage: instances,
+const out = [];
+const section = (title, rows, detail) => {
+  if (!rows.length) return;
+  out.push("");
+  out.push(title.toUpperCase() + "  " + rows.length +
+    (rows.length > CAP ? "  (showing " + CAP + ")" : ""));
+  for (const r of rows.slice(0, CAP)) out.push("  " + at(r) + detail(r));
 };
+
+out.push(root.id + "  " + root.name + " [" + root.type + "]  ·  visited " + visited +
+  ", instances " + instanceCount);
+out.push("scale: " + scale.join(", "));
+
+section("raw fills", rawFills, (r) => r.value + (r.idx ? "  #" + r.idx : ""));
+section("raw strokes", rawStrokes, (r) => r.value + (r.idx ? "  #" + r.idx : ""));
+section("raw text", rawText, (r) => pad(r.font, 24) + pad(r.size, 6) +
+  JSON.stringify(r.chars));
+section("raw radius", rawRadius, (r) => String(r.radius));
+section("off scale", offScale, (r) => r.prop + " " + r.value);
+section("likely detached", detached, () => "");
+
+const names = Object.keys(instances).sort((a, b) => instances[b] - instances[a]);
+if (names.length) {
+  out.push("");
+  out.push("INSTANCES  " + instanceCount + " in " + names.length + " components");
+  for (const n of names) out.push("  " + pad(instances[n], 5) + n);
+}
+
+if (out.length === 2) out.push("", "nothing raw found — everything is bound or styled");
+return out.join("\n");

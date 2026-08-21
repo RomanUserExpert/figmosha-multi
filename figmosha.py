@@ -952,7 +952,12 @@ for (const v of all) {
 
 let shown = 0;
 let qualified = 0;
+// `shown` counts the whole file, so the cap is a property of the command, not
+// of a collection — and `break` only leaves the inner loop. Without this flag
+// a file with seven collections printed the same warning seven times.
+let stopped = false;
 for (const col of cols) {
+  if (stopped) break;
   const picked = (byCollection[col.id] || []).filter(
     (v) => !FILTER || v.name.toLowerCase().indexOf(FILTER) !== -1);
   // A collection with nothing matching is not an answer, it is a line of
@@ -988,7 +993,11 @@ for (const col of cols) {
   const label = (v) => ambiguous(v) ? col.name + '/' + v.name : v.name;
   const width = Math.min(38, Math.max.apply(null, picked.map((v) => label(v).length)) + 2);
   for (const v of picked) {
-    if (shown++ >= __MAX__) { out.push('  … stopped at __MAX__ rows — narrow the filter'); break; }
+    if (shown++ >= __MAX__) {
+      out.push('  … stopped at __MAX__ rows — narrow the filter');
+      stopped = true;
+      break;
+    }
     if (ambiguous(v)) qualified++;
     const cells = [];
     for (const m of col.modes) cells.push(await value(v, m.modeId));

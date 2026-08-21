@@ -67,6 +67,7 @@ class Session:
         # never global — different documents are genuinely parallel.
         self.lock = asyncio.Lock()
         self.queued = 0              # callers waiting for the lock right now
+        self.pong_waiters: list = []  # futures resolved by the next pong
         self.opened = time.time()
         self.last_seen = time.monotonic()
 
@@ -236,17 +237,24 @@ async def _incumbent_answers(session: Session, timeout: float = 1.0) -> bool:
     ws = session.ws
     if ws is None or ws.closed:
         return False
-    before = session.last_seen
+
+    # Waited for rather than polled: this runs while a plugin is reconnecting,
+    # and a 50 ms poll turned a 5 ms answer into a 50 ms one on every re-Run.
+    fut = asyncio.get_running_loop().create_future()
+    session.pong_waiters.append(fut)
     try:
-        await ws.send_str(json.dumps({"type": "ping"}))
-    except Exception:
-        return False
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
-        if session.last_seen > before:
+        try:
+            await ws.send_str(json.dumps({"type": "ping"}))
+        except Exception:
+            return False
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
             return True
-    return False
+        except asyncio.TimeoutError:
+            return False
+    finally:
+        if fut in session.pong_waiters:
+            session.pong_waiters.remove(fut)
 
 
 async def _first_message(ws) -> dict | None:
@@ -319,8 +327,12 @@ def _handle_message(session: Session, m: dict) -> None:
               f"file={session.file or '?'}")
         return
     if mtype == "pong":
-        # Answer to _incumbent_answers(); the timestamp bump is the whole
-        # point, nothing else to do.
+        # Answer to _incumbent_answers(): hand it to whoever is waiting. The
+        # timestamp bump happens in the read loop either way.
+        for fut in session.pong_waiters:
+            if not fut.done():
+                fut.set_result(True)
+        session.pong_waiters.clear()
         return
     if mtype == "page":
         session.page = m.get("page", session.page)
@@ -507,7 +519,6 @@ async def exec_handler(request: web.Request) -> web.Response:
     try:
         await asyncio.wait_for(session.lock.acquire(), timeout=timeout)
     except asyncio.TimeoutError:
-        session.queued -= 1
         return json_response(
             {"ok": False,
              "error": f"timeout after {timeout:.0f}s waiting for "
@@ -517,7 +528,13 @@ async def exec_handler(request: web.Request) -> web.Response:
              "hint": "another script is running in this file - see `queued` in "
                      "GET /sessions"},
             status=504)
-    session.queued -= 1
+    finally:
+        # finally, not one decrement per exit path: a caller who walks away
+        # mid-wait — Ctrl-C, a closed terminal — raises CancelledError here,
+        # and the count it leaves behind never comes down. `queued` is what
+        # both `sessions` and the 504 hint report, so it lies for as long as
+        # the bridge runs.
+        session.queued -= 1
 
     try:
         waited_ms = int((time.monotonic() - queued_at) * 1000)
@@ -704,8 +721,32 @@ def main():
           f"-H 'Content-Type: application/json' "
           f"-d '{{\"code\":\"return figma.currentPage.name\"}}'")
 
-    web.run_app(build_app(), host=args.host, port=args.port, print=None)
+    # On Windows, SO_REUSEADDR reads as permission to bind over a live
+    # listener, and the two bridges then split the port: the plugin holds its
+    # WebSocket in one process while the CLI posts to the other. The symptom —
+    # a session that exists but answers «Cannot write to closing transport» —
+    # points nowhere near the cause, so refuse the second bind instead.
+    #
+    # Only on Windows: everywhere else SO_REUSEADDR is what lets a restart
+    # rebind immediately instead of waiting out TIME_WAIT, and `start-bridge.sh
+    # -Restart` depends on that.
+    reuse = False if sys.platform == "win32" else None
+    try:
+        web.run_app(build_app(), host=args.host, port=args.port, print=None,
+                    reuse_address=reuse)
+    except OSError as e:
+        # A traceback here says "errno 10048" and nothing about what to do; the
+        # answer is almost always that a bridge for this project is already up.
+        if e.errno not in (48, 98, 10048):        # EADDRINUSE, BSD/Linux/Windows
+            raise
+        print(f"[bridge] port {args.port} is already in use — a bridge for this "
+              f"project is probably already running.")
+        print(r"          check it:  curl http://127.0.0.1:%d/status" % args.port)
+        print(r"          restart:   .\start-bridge.ps1 -Restart   (bash: ./start-bridge.sh)")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    # The exit code matters: start-bridge waits on it to tell "already up" from
+    # "failed to start".
+    sys.exit(main() or 0)

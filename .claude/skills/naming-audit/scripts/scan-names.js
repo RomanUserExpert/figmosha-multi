@@ -59,17 +59,43 @@ for (const key of Object.keys(bySibling)) {
   }
 }
 
-const trim = (a) => ({ count: a.length, rows: a.slice(0, CAP) });
-
-return {
-  root: { id: root.id, name: root.name, type: root.type },
-  stats: {
-    total: flat.length,
-    maxDepth: maxDepth,
-    namedShare: flat.length ? Math.round((named / flat.length) * 100) + "%" : "n/a",
-  },
-  defaults: trim(defaults),
-  duplicates: trim(duplicates),
-  unnamedText: trim(unnamedText),
-  risky: trim(risky),
+// Rows, not nested objects: the same findings cost roughly a third as much,
+// and the reader is an agent paying per character.
+const pad = (s, w) => (String(s) + "                                        ")
+  .slice(0, Math.max(w, String(s).length));
+const at = (r) => pad(r.id, 12) + pad(r.name + " [" + r.type + "]", 30);
+const out = [];
+const section = (title, rows, detail) => {
+  if (!rows.length) return;
+  out.push("");
+  out.push(title.toUpperCase() + "  " + rows.length +
+    (rows.length > CAP ? "  (showing " + CAP + ")" : ""));
+  for (const r of rows.slice(0, CAP)) out.push("  " + at(r) + detail(r));
 };
+
+out.push(root.id + "  " + root.name + " [" + root.type + "]  ·  " + flat.length +
+  " layers, depth " + maxDepth + ", named " +
+  (flat.length ? Math.round((named / flat.length) * 100) + "%" : "n/a"));
+
+section("default names", defaults, (r) => "in «" + r.parent + "»  depth " + r.depth);
+section("text named after its content", unnamedText, (r) => JSON.stringify(r.chars));
+section("risky to rename", risky, (r) => r.why || "");
+
+// A duplicate is a group of siblings, not one node, so it has no single id to
+// print in the id column.
+if (duplicates.length) {
+  out.push("");
+  out.push("DUPLICATE SIBLINGS  " + duplicates.length +
+    (duplicates.length > CAP ? "  (showing " + CAP + ")" : ""));
+  for (const r of duplicates.slice(0, CAP)) {
+    // The parent here is a full path; its last segment is what locates the
+    // group for a human, and the rest is what makes the row unreadable.
+    const parent = r.parent.split("/").filter(Boolean).pop() || "(root)";
+    out.push("  " + pad(r.name, 26) + pad(r.ids.length + "×", 5) +
+      pad("in «" + parent + "»", 30) + "  " + r.ids.slice(0, 4).join(", ") +
+      (r.ids.length > 4 ? " …" : ""));
+  }
+}
+
+if (out.length === 1) out.push("", "nothing to clean up");
+return out.join("\n");

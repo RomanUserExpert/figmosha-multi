@@ -9,6 +9,90 @@ code it started with, so new helpers won't exist until you do. If
 `plugin/manifest.json` changed, re-*import* it rather than just re-running, and
 re-run `figmosha init` so the copy's project identity survives the update.
 
+## [2.4.0] — 2026-08-21
+
+2.3 made output cheap. The unit left unoptimised was the **agent's turn** —
+seconds of thinking plus a whole context read — and the way Figmosha spent it
+was by making its caller write JavaScript. Ten subcommands could read the
+document and four could change it; anything else meant a hand-written `exec`,
+with the frozen-fills and auto-layout-order traps that cost a turn each time
+they were hit.
+
+The measure of this release is one task: binding hardcoded values to tokens
+should take three turns, not five to seven.
+
+```
+before:  sel → props → vars → write 15 lines of exec → error → fix
+after:   sel → props → bind
+```
+
+### Added
+
+- **`figmosha set` and `figmosha bind`.** `set` takes literal values
+  (`gap=16 fill=#f5f5f5 pad=12,16 w=fill`), `bind` takes token names
+  (`gap=space/md fill=surface/canvas`); `bind key=none` removes a binding. Keys
+  are applied in a fixed order — layout, size, spacing, align — regardless of
+  the order typed, because auto-layout silently drops whatever is set too early.
+  `sel` means the whole selection, as in `rm`. Every mutation prints
+  **before → after**, with a second arrow naming the token; `--dry-run` prints
+  the same table and writes nothing. That diff is the only undo there is:
+  Figma's history is not reachable from a plugin.
+- **Variables and styles by name.** `h.bF` / `h.bS` / `h.bN` and the new
+  `h.applyStyle` accept a token name, a local id, or a library key. Names match
+  most specific first: exact, then ignoring case, then qualified with the
+  collection (`Semantics/color/bg/default`), then as a suffix on a `/` boundary
+  (`bg/default` finds `color/bg/default`, never `bg/default-alt`). A name that
+  matches more than one **throws with the candidates listed** rather than
+  guessing — in a themed library every primitive exists twice.
+- **`figmosha where <id>`** — the path from the page down, with each ancestor's
+  size and sizing mode, which is what "why did this move" is actually about.
+- **`figmosha overrides <id>`** — what an instance overrides against its main
+  component, with the nested ids (`I10:239;88:9705`) resolved to layer names.
+- **`exec --set NAME=value`** (repeatable) defines a const before the code —
+  JSON when it parses as JSON, a string when it does not. This removes the
+  assemble-a-copy-per-run step from all four skills.
+- **`h.applyStyle(node, kind, name)`** and `h.style_(kind, name)` for
+  `fill` / `stroke` / `text` / `effect` / `grid`.
+
+### Changed
+
+- **`tree` defaults to depth 3**, not 99. A cut branch prints `… +N deeper`
+  with the real count, so the decision to dig is made against a number. Three or
+  more siblings sharing a name **and** type collapse into one row naming the id
+  range; `--no-collapse` turns that off. Measured on a real page: 424 lines
+  against 1077.
+- **`find` prints 100 rows** and then says how many were left, with the
+  `--limit` that would show them. `--raw` stays unbounded on purpose: a
+  truncated array carries no sign that a tail is missing.
+- **`vars` qualifies ambiguous names.** A name living in more than one
+  collection prints as `Collection/name` — the form that resolves — and the rest
+  stay short. On a themed library that is about a quarter of the file.
+- **The variable list is cached as a snapshot** of `{name, group}` for the
+  duration of one exec, not as the Figma objects. Every property read on a Figma
+  node crosses into the engine: reading `name` across 438 variables costs ~14 ms,
+  and a four-rung ladder over live proxies paid that toll on every resolve. Ten
+  resolves went from 73 ms to 1 ms.
+- **All four skills return tables**, not nested objects, and are fed with
+  `--set` instead of a temp file built per run.
+
+### Fixed
+
+- **`session.queued` leaked upward.** The counter came down on the timeout path
+  and on success, but not on `CancelledError` — an ordinary Ctrl-C — so
+  `sessions` and the 504 hint over-reported the queue for as long as the bridge
+  ran. It is a `finally` now.
+- **A second bridge could take a port that was already in use.** Windows reads
+  `SO_REUSEADDR` as permission to bind over a live listener, and the two
+  processes then split the port: the plugin holds its WebSocket in one while the
+  CLI posts to the other. The symptom — a session that exists but answers
+  `Cannot write to closing transport` — points nowhere near the cause.
+  `reuse_address=False`.
+- **`vars` repeated its truncation warning once per collection.** The row
+  counter is per file but `break` only left the inner loop; a seven-collection
+  file said it three times for a common filter.
+- **`_incumbent_answers` polled for the pong** every 50 ms instead of waiting
+  for it. It resolves a future now, which is what a reconnecting plugin waits on.
+
 ## [2.3.0] — 2026-08-20
 
 Output is the thing an agent pays for, and Figmosha was charging about three

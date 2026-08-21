@@ -151,15 +151,46 @@ for (const n of flat) {
 }
 
 const CAP = 80;
-const trim = (a) => ({ count: a.length, rows: a.slice(0, CAP) });
-
-return {
-  root: { id: root.id, name: root.name, w: Math.round(root.width), h: Math.round(root.height) },
-  layout: trim(layout),
-  typography: trim(typography),
-  colors: trim(colors),
-  radius: trim(radius),
-  sizing: trim(sizing),
-  instances: trim(instances),
-  untokenized: trim(untokenized),
+// Rows, not nested objects: the same findings cost roughly a third as much,
+// and the reader is an agent paying per character.
+const pad = (s, w) => (String(s) + "                                        ")
+  .slice(0, Math.max(w, String(s).length));
+const at = (r) => pad(r.id, 12) + pad(r.name + " [" + r.type + "]", 30);
+const out = [];
+const section = (title, rows, detail) => {
+  if (!rows.length) return;
+  out.push("");
+  out.push(title.toUpperCase() + "  " + rows.length +
+    (rows.length > CAP ? "  (showing " + CAP + ")" : ""));
+  for (const r of rows.slice(0, CAP)) out.push("  " + at(r) + detail(r));
 };
+
+const tok = (t) => t ? "  → " + t : "";
+
+out.push(root.id + "  " + root.name + "  " + Math.round(root.width) + "×" +
+  Math.round(root.height));
+
+// A token per value is the whole point of the spec, so it goes on the row
+// rather than into a nested object the reader has to cross-reference.
+const tokensOf = (tk) => {
+  const keys = Object.keys(tk || {});
+  return keys.length ? "  → " + keys.map((k) => k + ":" + tk[k]).join(" ") : "";
+};
+
+section("layout", layout, (r) =>
+  pad(r.direction, 11) + "gap:" + pad(r.gap, 5) + "pad:" + pad(r.padding, 14) +
+  pad(r.sizing, 10) + "align:" + r.align + tokensOf(r.tokens));
+section("typography", typography, (r) =>
+  pad(r.font, 22) + pad(r.size + "/" + r.lineHeight, 9) + pad(r.color || "—", 9) +
+  tok(r.textStyle || r.colorToken) +
+  (r.chars ? "  " + JSON.stringify(r.chars) : ""));
+section("colors", colors, (r) => pad(r.property, 10) + pad(r.value, 10) + tok(r.token));
+section("radius", radius, (r) => pad(r.value, 14) + tok(r.token));
+section("sizing", sizing, (r) => pad(r.w + "×" + r.h, 12) +
+  tok(r.widthToken + " / " + r.heightToken));
+section("instances", instances, (r) =>
+  pad(r.component || "?", 24) + pad(r.variant || "", 18) +
+  (r.props && Object.keys(r.props).length ? JSON.stringify(r.props) : ""));
+section("untokenized", untokenized, (r) => pad(r.prop, 14) + r.value);
+
+return out.join("\n");

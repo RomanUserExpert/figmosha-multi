@@ -107,9 +107,31 @@ for (const t of texts) {
 const fails = rows.filter((r) => r.verdict === "FAIL");
 const manual = rows.filter((r) => r.verdict === "needs manual check");
 
-return {
-  root: { id: root.id, name: root.name },
-  totals: { texts: rows.length, fail: fails.length, manual: manual.length },
-  fail: fails,
-  manual: manual.slice(0, 30),
-};
+// Rows, not nested objects — see the note in scan.js.
+const pad = (s, w) => (String(s) + "                                        ")
+  .slice(0, Math.max(w, String(s).length));
+const out = [root.id + "  " + root.name + "  ·  " + rows.length + " texts, " +
+  fails.length + " failing, " + manual.length + " to check by hand"];
+
+// A manual row has no numbers to print — it has a reason, which is the only
+// thing that tells the reader what to do about it.
+const line = (r) => "  " + pad(r.id, 12) + pad(r.name, 22) +
+  (r.ratio === undefined
+    ? pad(r.why || "needs a look", 38)
+    : pad(String(r.ratio), 6) + pad("need " + r.required, 10) +
+      pad(r.fg + " on " + r.bg + " («" + r.bgFrom + "»)", 34)) +
+  (r.chars ? JSON.stringify(r.chars) : "");
+
+if (fails.length) {
+  out.push("");
+  out.push("FAIL  " + fails.length);
+  for (const r of fails) out.push(line(r));
+}
+if (manual.length) {
+  out.push("");
+  out.push("MANUAL  " + manual.length + (manual.length > 30 ? "  (showing 30)" : ""));
+  for (const r of manual.slice(0, 30)) out.push(line(r));
+}
+if (!rows.length) out.push("", "no text in this subtree");
+else if (!fails.length && !manual.length) out.push("", "every text passes its threshold");
+return out.join("\n");

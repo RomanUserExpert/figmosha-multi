@@ -1,4 +1,4 @@
-# Figmosha 2.3
+# Figmosha 2.4
 
 Drive Figma from your terminal / Claude Code / any HTTP client. A tiny custom plugin sits inside Figma Desktop and holds a WebSocket to a local Python server — you send Figma Plugin API code over HTTP and get the result back.
 

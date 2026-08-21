@@ -103,4 +103,33 @@ for (const id of REFS) {
   report.push(entry);
 }
 
-return report;
+// The report is one entry per reference component, and its shape varies with
+// what the component has — so it is rendered key by key rather than pinned to
+// a fixed table. Still rows: nesting is what made this expensive to read.
+const out = [];
+const walk = (value, indent) => {
+  if (value === null || value === undefined) { out.push(indent + "—"); return; }
+  if (Array.isArray(value)) {
+    if (!value.length) { out.push(indent + "(none)"); return; }
+    for (const item of value) {
+      if (item && typeof item === "object") walk(item, indent);
+      else out.push(indent + String(item));
+    }
+    return;
+  }
+  if (typeof value === "object") {
+    for (const k of Object.keys(value)) {
+      const v = value[k];
+      if (v && typeof v === "object") {
+        out.push(indent + k + ":");
+        walk(v, indent + "  ");
+      } else {
+        out.push(indent + k + ": " + v);
+      }
+    }
+    return;
+  }
+  out.push(indent + String(value));
+};
+walk(report, "");
+return out.join("\n");
