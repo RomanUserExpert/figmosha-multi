@@ -33,9 +33,8 @@ python figmosha.py tree <ref-id> --depth 3 --no-size --no-text
 ## Шаг 2 — скан
 
 ```bash
-{ echo 'const ROOT_ID = "185:21880";'
-  cat .claude/skills/naming-audit/scripts/scan-names.js; } > "$SCRATCHPAD/names.js"
-python figmosha.py exec --file "$SCRATCHPAD/names.js" --timeout 120
+python figmosha.py exec --file .claude/skills/naming-audit/scripts/scan-names.js \
+  --set ROOT_ID=185:21880 --timeout 120
 ```
 
 Вернётся:
@@ -65,9 +64,8 @@ Group 3          | 185:22011  | Card/Actions          | внутри компо�
 ## Шаг 5 — применение (только после «да»)
 
 ```bash
-{ echo 'const RENAMES = [{"id":"185:22001","to":"Card/Content"}, ...];'
-  cat .claude/skills/naming-audit/scripts/apply-renames.js; } > "$SCRATCHPAD/apply.js"
-python figmosha.py exec --file "$SCRATCHPAD/apply.js"
+python figmosha.py exec --file .claude/skills/naming-audit/scripts/apply-renames.js \
+  --set 'RENAMES=[{"id":"185:22001","to":"Card/Content"}]'
 ```
 
 Скрипт возвращает `{id, before, after}` по каждому — приложить к ответу как подтверждение, что применилось именно задуманное.

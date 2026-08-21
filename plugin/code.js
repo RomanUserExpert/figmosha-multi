@@ -344,16 +344,28 @@ const HELPERS = {
     return root.findAll((n) => n.name === name);
   },
 
-  // Dump subtree as indented text
+  // Dump subtree as indented text.
+  //
+  // Two ceilings, because the shape of a real file defeats a plain walk: it is
+  // deep, and it is repetitive. A depth cut that does not say how much it hid
+  // leaves the caller guessing whether to dig; a list of forty identical rows
+  // costs forty rows to say one thing.
   dumpTree(node, opts) {
     opts = opts || {};
     const maxDepth = opts.maxDepth == null ? 99 : opts.maxDepth;
     const showSize = opts.showSize !== false;
     const showText = opts.showText !== false;
     const showLayout = opts.showLayout === true;
+    const collapse = opts.collapse !== false;
     const lines = [];
+
+    const descendants = (n) => {
+      let count = 0;
+      if (n.children) for (const c of n.children) count += 1 + descendants(c);
+      return count;
+    };
+
     const walk = (n, d) => {
-      if (d > maxDepth) return;
       const pad = "  ".repeat(d);
       let line = pad + n.name + " [" + n.type + "] " + n.id;
       if (showSize && n.width !== undefined) {
@@ -367,7 +379,34 @@ const HELPERS = {
       }
       if (showText && n.type === "TEXT") line += ' "' + n.characters + '"';
       lines.push(line);
-      if (n.children) for (const c of n.children) walk(c, d + 1);
+
+      if (!n.children || !n.children.length) return;
+      if (d >= maxDepth) {
+        // The number is the whole point: "dig or not" should be a decision
+        // made against a count, not a guess.
+        const hidden = descendants(n);
+        lines.push("  ".repeat(d + 1) + "… +" + hidden + " deeper (--depth)");
+        return;
+      }
+
+      const kids = n.children;
+      for (let i = 0; i < kids.length; i++) {
+        let run = 1;
+        if (collapse) {
+          while (i + run < kids.length &&
+                 kids[i + run].name === kids[i].name &&
+                 kids[i + run].type === kids[i].type) run++;
+        }
+        walk(kids[i], d + 1);
+        // Three is the threshold: collapsing a pair saves nothing and hides
+        // half of what it describes.
+        if (run >= 3) {
+          const last = kids[i + run - 1];
+          lines.push("  ".repeat(d + 1) + "… " + (run - 1) +
+            " more siblings named the same (" + kids[i + 1].id + " … " + last.id + ")");
+          i += run - 1;
+        }
+      }
     };
     walk(node, 0);
     return lines.join("\n");

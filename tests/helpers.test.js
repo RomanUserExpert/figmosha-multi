@@ -241,6 +241,45 @@ async function throws(fn) {
   check("and says so when the node has no such style",
         /takes no fill style/.test(wrongKind || ""), true);
 
+  // ── dumpTree ceilings ──────────────────────────────────────────────────
+  // A real page is deep and repetitive; a walk with neither ceiling is a
+  // command that looks cheap and returns a context window.
+  const kid = (id, name, children) => ({
+    id, name, type: "FRAME", width: 10, height: 10, children: children || [],
+  });
+  const deep = kid("0:1", "Root", [
+    kid("0:2", "A", [kid("0:3", "B", [kid("0:4", "C", [kid("0:5", "D", [])])])]),
+  ]);
+
+  const cut = h.dumpTree(deep, { maxDepth: 2 });
+  check("depth stops where it was told", /C \[FRAME\]/.test(cut), false);
+  check("and says how much it hid", /… \+2 deeper/.test(cut), true);
+  check("full depth still walks everything",
+        /D \[FRAME\]/.test(h.dumpTree(deep, { maxDepth: 99 })), true);
+
+  const many = (n, name) => Array.from({ length: n }, (_, i) => kid("9:" + i, name));
+  const three = h.dumpTree(kid("9:9", "Row", many(30, "Item")), {});
+  check("identical siblings collapse to one row",
+        (three.match(/Item \[FRAME\]/g) || []).length, 1);
+  check("and the collapsed row counts them", /… 29 more siblings named the same/.test(three), true);
+  check("with the id range spelled out", /\(9:1 … 9:29\)/.test(three), true);
+
+  const two = h.dumpTree(kid("9:9", "Row", many(2, "Item")), {});
+  check("a pair is not worth collapsing",
+        (two.match(/Item \[FRAME\]/g) || []).length, 2);
+
+  const off = h.dumpTree(kid("9:9", "Row", many(30, "Item")), { collapse: false });
+  check("--no-collapse lists them all",
+        (off.match(/Item \[FRAME\]/g) || []).length, 30);
+
+  // Same name, different type — collapsing those would claim more than it knows.
+  const mixed = kid("9:9", "Row", [
+    kid("9:1", "Item"), kid("9:2", "Item"),
+    { id: "9:3", name: "Item", type: "TEXT", characters: "x", width: 1, height: 1 },
+  ]);
+  check("type is part of the sameness",
+        (h.dumpTree(mixed, {}).match(/Item \[/g) || []).length, 3);
+
   // The caches are dropped by the exec handler itself, not only by hand.
   clearExecCaches();
   calls.listVars = 0;

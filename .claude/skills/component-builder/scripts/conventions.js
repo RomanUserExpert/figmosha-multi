@@ -1,8 +1,8 @@
 // Extract the conventions of reference components so a new one can match them.
-// Read-only. Prepend:  const REFS = ["185:21883", "185:22010"];
+// Read-only. Fed with:  --set 'REFS=["185:21883","185:22010"]'
 
 if (typeof REFS === "undefined" || !REFS.length) {
-  throw new Error("prepend: const REFS = [\"<component-set-or-component-id>\", ...]");
+  throw new Error("no REFS: pass --set 'REFS=[\"<component-set-or-component-id>\"]'");
 }
 
 const isMixed = (v) => typeof v === "symbol";

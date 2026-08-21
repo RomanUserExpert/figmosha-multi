@@ -18,6 +18,7 @@ copy's venv itself. Both spellings appear below; they are the same thing.
 ```bash
 python figmosha.py exec "return figma.currentPage.name"
 python figmosha.py exec --file script.js
+python figmosha.py exec --file scan.js --set ROOT_ID=185:21880   # const, before the code
 python figmosha.py "return figma.currentPage.name"     # exec is implied
 python figmosha.py text 185:21880 "Привіт"             # subcommands, see below
 python figmosha.py status
@@ -78,9 +79,9 @@ Rules that follow from how Figma works, not from Figmosha:
 | `figmosha vars [filter] [--type T]` | Which variables exist and what they resolve to, per mode. No filter — a map of collections, not a dump of the file. `--library` for collections this file consumes |
 | `figmosha styles [filter]` | Local paint / text / effect / grid styles with their values |
 | `figmosha props <id> [--all] [-c]` | Everything set on one node, with variables and styles **by name** — the fastest answer to "is this bound or hardcoded?". `-c` adds a row per child with its sizing, for "why did this move" |
-| `figmosha tree <id> [--depth N] [--layout]` | Explore structure |
+| `figmosha tree <id> [--depth N] [--layout]` | Explore structure. **Depth 3 by default**; a cut branch says `… +N deeper`, and three or more identical siblings collapse into one row (`--no-collapse` to see them all) |
 | `figmosha find <id> name=Button` | Locate by exact name (`name~Btn` = substring) |
-| `figmosha find <id> type=INSTANCE` | Filter by type (also `text=`, `text~`) |
+| `figmosha find <id> type=INSTANCE` | Filter by type (also `text=`, `text~`). Prints 100 rows, then says how many were left (`--limit N`) |
 | `figmosha set <id> gap=16 fill=#f5f5f5` | Change literal values — the alternative to a hand-written exec |
 | `figmosha bind <id> gap=space/md fill=surface/bg` | Bind the same keys to variables **by token name** |
 | `figmosha text <id> "новий"` | Edit text, fonts loaded for you |

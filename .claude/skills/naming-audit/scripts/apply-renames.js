@@ -1,8 +1,8 @@
-// Apply a confirmed rename map. Prepend:
+// Apply a confirmed rename map. Fed with --set:
 //   const RENAMES = [{ id: "185:22001", to: "Card/Content" }, ...];
 
 if (typeof RENAMES === "undefined" || !Array.isArray(RENAMES) || !RENAMES.length) {
-  throw new Error("prepend: const RENAMES = [{id, to}, ...]");
+  throw new Error("no RENAMES: pass --set 'RENAMES=[{\"id\":…,\"to\":…}]'");
 }
 
 const applied = [], skipped = [];

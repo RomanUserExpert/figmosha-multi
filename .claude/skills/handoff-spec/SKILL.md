@@ -27,9 +27,8 @@ $env:FIGMOSHA_SESSION = "<имя файла или sid>"   # разово: --ses
 ## Шаг 1 — извлечь
 
 ```bash
-{ echo 'const ROOT_ID = "185:21880";'
-  cat .claude/skills/handoff-spec/scripts/extract.js; } > "$SCRATCHPAD/spec.js"
-python figmosha.py exec --file "$SCRATCHPAD/spec.js" --timeout 120
+python figmosha.py exec --file .claude/skills/handoff-spec/scripts/extract.js \
+  --set ROOT_ID=185:21880 --timeout 120
 ```
 
 Вернётся:

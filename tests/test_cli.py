@@ -409,6 +409,66 @@ def test_set_rejects_an_argument_without_an_equals_sign(monkeypatch, capsys):
     assert figmosha.cmd_set(parse("set", "1:2", "gap")) == 2
     assert "key=value" in capsys.readouterr().err
 
+
+# ─── ceilings and exec --set ──────────────────────────────────────────────
+
+@needs_node
+def test_find_prints_a_limited_number_of_rows(monkeypatch):
+    """Two hits, room for one: the count must still be honest."""
+    seen = captured(monkeypatch)
+    figmosha.cmd_find(parse("find", "page", "name~", "--limit", "1"))
+    out = run_js(seen["code"])
+    assert out.startswith("2 found")
+    assert "showing 1 of 2" in out
+    assert len([l for l in out.splitlines() if l.startswith("1:")]) == 1
+
+
+@needs_node
+def test_find_says_nothing_extra_when_everything_fits(monkeypatch):
+    seen = captured(monkeypatch)
+    figmosha.cmd_find(parse("find", "page", "name~"))
+    out = run_js(seen["code"])
+    assert "showing" not in out
+
+
+def test_tree_defaults_to_three_levels():
+    assert parse("tree", "page").depth == 3
+
+
+def test_exec_set_defines_a_string_const():
+    assert figmosha.prelude(["ROOT=185:21880"]) == 'const ROOT = "185:21880";\n'
+
+
+def test_exec_set_parses_json_when_it_is_json():
+    assert figmosha.prelude(["SCALE=[0,4,8]"]) == "const SCALE = [0, 4, 8];\n"
+    assert figmosha.prelude(["N=12"]) == "const N = 12;\n"
+
+
+def test_exec_set_keeps_non_ascii_readable():
+    assert figmosha.prelude(['NAME=Привіт']) == 'const NAME = "Привіт";\n'
+
+
+def test_exec_set_refuses_a_name_that_is_not_an_identifier():
+    with pytest.raises(ValueError, match="not a JS identifier"):
+        figmosha.prelude(["my-const=1"])
+
+
+def test_exec_set_refuses_an_argument_without_a_value():
+    with pytest.raises(ValueError, match="NAME=value"):
+        figmosha.prelude(["ROOT"])
+
+
+def test_exec_set_lands_before_the_code(monkeypatch):
+    seen = captured(monkeypatch)
+    figmosha.cmd_exec(parse("exec", "return ROOT;", "--set", "ROOT=1:2"))
+    assert seen["code"] == 'const ROOT = "1:2";\nreturn ROOT;'
+
+
+def test_exec_without_set_is_untouched(monkeypatch):
+    seen = captured(monkeypatch)
+    figmosha.cmd_exec(parse("exec", "return 1;"))
+    assert seen["code"] == "return 1;"
+
 # ─── doctor ───────────────────────────────────────────────────────────────
 
 def test_doctor_reads_the_file_it_reports(monkeypatch, capsys):

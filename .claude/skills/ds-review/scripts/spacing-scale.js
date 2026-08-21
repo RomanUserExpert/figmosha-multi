@@ -1,5 +1,5 @@
 // Derive the file's actual spacing scale instead of assuming one. Read-only.
-// Optional prepend:  const ROOT_ID = "185:21880";   (default: whole current page)
+// Optional:  --set ROOT_ID=185:21880   (default: whole current page)
 
 const root = (typeof ROOT_ID !== "undefined" && ROOT_ID)
   ? await h.node(ROOT_ID)

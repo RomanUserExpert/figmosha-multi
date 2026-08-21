@@ -256,6 +256,7 @@ python figmosha.py "return figma.currentPage.children.length"
 
 # From a file
 python figmosha.py exec --file my-script.js
+python figmosha.py exec --file my-script.js --set ROOT_ID=185:21880 --set 'SCALE=[0,4,8]'
 
 # From stdin
 cat my-script.js | python figmosha.py exec --stdin

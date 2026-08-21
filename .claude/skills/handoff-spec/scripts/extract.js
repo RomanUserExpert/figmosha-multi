@@ -1,10 +1,10 @@
-// Dev-handoff extraction — read-only. Prepend:  const ROOT_ID = "185:21880";
+// Dev-handoff extraction — read-only. Fed with:  --set ROOT_ID=185:21880
 // Every numeric/colour value is reported together with the token behind it.
 
 const root = (typeof ROOT_ID !== "undefined" && ROOT_ID)
   ? await h.node(ROOT_ID)
   : figma.currentPage.selection[0];
-if (!root) throw new Error("no root: prepend ROOT_ID or select a frame in Figma");
+if (!root) throw new Error("no root: pass --set ROOT_ID=<id>, or select a frame in Figma");
 
 const isMixed = (v) => typeof v === "symbol";
 const hex = (c) => "#" + [c.r, c.g, c.b]

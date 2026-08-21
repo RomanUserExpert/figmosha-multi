@@ -1,9 +1,9 @@
-// Layer naming scan — read-only. Prepend:  const ROOT_ID = "185:21880";
+// Layer naming scan — read-only. Fed with:  --set ROOT_ID=185:21880
 
 const root = (typeof ROOT_ID !== "undefined" && ROOT_ID)
   ? await h.node(ROOT_ID)
   : figma.currentPage.selection[0];
-if (!root) throw new Error("no root: prepend ROOT_ID or select a frame in Figma");
+if (!root) throw new Error("no root: pass --set ROOT_ID=<id>, or select a frame in Figma");
 
 const CAP = 60;
 const DEFAULT_NAME = /^(Frame|Group|Rectangle|Ellipse|Polygon|Star|Line|Vector|Slice|Component|Union|Subtract|Intersect|Exclude)(\s\d+)?$/;

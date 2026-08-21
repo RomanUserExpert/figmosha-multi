@@ -31,9 +31,8 @@ python figmosha.py find <page-or-frame-id> type=COMPONENT_SET
 Затем снять с них конвенции:
 
 ```bash
-{ echo 'const REFS = ["185:21883", "185:22010"];'
-  cat .claude/skills/component-builder/scripts/conventions.js; } > "$SCRATCHPAD/conv.js"
-python figmosha.py exec --file "$SCRATCHPAD/conv.js"
+python figmosha.py exec --file .claude/skills/component-builder/scripts/conventions.js \
+  --set 'REFS=["185:21883","185:22010"]'
 ```
 
 Скрипт вернёт: имена вариантов и разбор на `Property=Value`, `variantGroupProperties`, componentPropertyDefinitions, настройки auto-layout, какие переменные к чему привязаны, имена слоёв.

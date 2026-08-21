@@ -1343,6 +1343,34 @@ def cmd_sessions(args):
     return 0
 
 
+IDENTIFIER = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
+
+
+def prelude(assignments):
+    """`--set ROOT=185:21880` -> `const ROOT = "185:21880";` before the code.
+
+    A script kept in a file almost always needs one or two ids from the caller,
+    and the alternative is editing the file before every run — a step in four
+    skills, and a copy of the script per invocation. The value is JSON when it
+    parses as JSON and a string when it does not, so `--set N=[0,4,8]` is an
+    array and `--set ID=185:21880` is not a syntax error.
+    """
+    lines = []
+    for item in assignments or []:
+        if "=" not in item:
+            raise ValueError(f"expected NAME=value, got {item!r}")
+        name, raw = item.split("=", 1)
+        name = name.strip()
+        if not IDENTIFIER.match(name):
+            raise ValueError(f"{name!r} is not a JS identifier — cannot be a const name")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        lines.append(f"const {name} = {json.dumps(value, ensure_ascii=False)};")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def cmd_exec(args):
     if args.file:
         with open(args.file, encoding="utf-8") as f:
@@ -1354,6 +1382,11 @@ def cmd_exec(args):
     else:
         print("figmosha: provide code (positional, --file, or --stdin)", file=sys.stderr)
         return 2
+    try:
+        code = prelude(args.set) + code
+    except ValueError as e:
+        print(f"figmosha: {e}", file=sys.stderr)
+        return 2
     return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
 
 
@@ -1363,6 +1396,7 @@ def cmd_tree(args):
         "showSize": not args.no_size,
         "showText": not args.no_text,
         "showLayout": args.layout,
+        "collapse": not args.no_collapse,
     })
     code = (
         f"const n = {node_expr(args.node_id)};"
@@ -1412,12 +1446,19 @@ def cmd_find(args):
         f"const found = root.findAll(n => {predicate});"
     )
     if args.raw:
+        # --raw is an explicit ask for the structure, and a truncated array is
+        # worse than a long one: nothing in it says a tail is missing.
         code = f"{preamble}return found.map({NODE_FIELDS_JS});"
     else:
         code = (
             f"{ROW_JS}{preamble}"
+            f"const LIMIT = {args.limit};"
+            f"const shown = found.slice(0, LIMIT);"
             f"return found.length + ' found'"
-            f" + (found.length ? '\\n' + found.map(row).join('\\n') : '');"
+            f" + (shown.length ? '\\n' + shown.map(row).join('\\n') : '')"
+            f" + (found.length > LIMIT"
+            f"    ? '\\n… showing ' + LIMIT + ' of ' + found.length +"
+            f"      ' — narrow the filter, or --limit ' + found.length : '');"
         )
     return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
 
@@ -1590,11 +1631,17 @@ def build_parser():
     g.add_argument("code", nargs="?")
     g.add_argument("--file", "-f")
     g.add_argument("--stdin", action="store_true")
+    p_exec.add_argument("--set", action="append", metavar="NAME=value",
+                        help="define a const before the code (repeatable)")
 
     p_tree = sub.add_parser("tree")
     _add_common_flags(p_tree)
     p_tree.add_argument("node_id", help="node id, or `page` / `sel`")
-    p_tree.add_argument("--depth", type=int, default=99)
+    # 3 rather than everything: the old default was survivable only because
+    # the result cap cut it off, which is a flood with a lid, not an answer.
+    p_tree.add_argument("--depth", type=int, default=3)
+    p_tree.add_argument("--no-collapse", action="store_true",
+                        help="list identical siblings one by one")
     p_tree.add_argument("--no-size", action="store_true")
     p_tree.add_argument("--no-text", action="store_true")
     p_tree.add_argument("--layout", action="store_true",
@@ -1624,6 +1671,8 @@ def build_parser():
     _add_common_flags(p_find)
     p_find.add_argument("node_id")
     p_find.add_argument("filter", help="name=X | name~X | type=X | text=X | text~X")
+    p_find.add_argument("--limit", type=int, default=100,
+                        help="rows to print before saying how many were left out")
 
     p_text = sub.add_parser("text")
     _add_common_flags(p_text)

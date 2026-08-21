@@ -55,14 +55,13 @@ python figmosha.py exec --file .claude/skills/ds-review/scripts/spacing-scale.js
 
 ## Шаг 3 — скан
 
-Скрипту нужен `ROOT_ID`. Собрать запускаемый файл:
+Скрипту нужен `ROOT_ID`. Значения передаются флагом, файл не трогается:
 
 ```bash
-SP="$SCRATCHPAD"   # каталог скретчпада из системного промпта
-{ echo 'const ROOT_ID = "185:21880";'
-  echo 'const SCALE = [0,4,8,12,16,24,32,40,48,64];'   # из шага 2
-  cat .claude/skills/ds-review/scripts/scan.js; } > "$SP/scan.js"
-python figmosha.py exec --file "$SP/scan.js" --timeout 120
+python figmosha.py exec --file .claude/skills/ds-review/scripts/scan.js \
+  --set ROOT_ID=185:21880 \
+  --set 'SCALE=[0,4,8,12,16,24,32,40,48,64]' \
+  --timeout 120
 ```
 
 Вернётся JSON: `rawFills`, `rawStrokes`, `rawText`, `offScale`, `rawRadius`, `instances`, `totals`.
@@ -70,9 +69,8 @@ python figmosha.py exec --file "$SP/scan.js" --timeout 120
 ## Шаг 4 — контраст (только если в скане есть текст)
 
 ```bash
-{ echo 'const ROOT_ID = "185:21880";'
-  cat .claude/skills/ds-review/scripts/contrast.js; } > "$SP/contrast.js"
-python figmosha.py exec --file "$SP/contrast.js" --timeout 120
+python figmosha.py exec --file .claude/skills/ds-review/scripts/contrast.js \
+  --set ROOT_ID=185:21880 --timeout 120
 ```
 
 Считает WCAG-контраст текста против ближайшего непрозрачного фона-предка. Порог: 4.5 для обычного текста, 3.0 для ≥18pt или ≥14pt bold — скрипт применяет это сам.

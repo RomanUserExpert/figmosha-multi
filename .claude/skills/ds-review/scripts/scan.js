@@ -1,11 +1,11 @@
-// Design-system scan — read-only. Prepend before running:
-//   const ROOT_ID = "185:21880";
+// Design-system scan — read-only. Fed with --set:
+//   --set ROOT_ID=185:21880
 //   const SCALE   = [0,4,8,12,16,24,32,40,48,64];
 
 const root = (typeof ROOT_ID !== "undefined" && ROOT_ID)
   ? await h.node(ROOT_ID)
   : figma.currentPage.selection[0];
-if (!root) throw new Error("no root: prepend ROOT_ID or select a frame in Figma");
+if (!root) throw new Error("no root: pass --set ROOT_ID=<id>, or select a frame in Figma");
 if (!root.children) throw new Error("root of type " + root.type + " has no children");
 
 const scale = (typeof SCALE !== "undefined" && SCALE) ? SCALE : [0, 4, 8, 12, 16, 24, 32, 40, 48, 64];
