@@ -82,7 +82,7 @@ SESSION = DEFAULT_SESSION
 KNOWN_CMDS = {
     "exec", "status", "doctor", "sel", "tree", "find", "text", "variant",
     "clone", "rm", "import-component", "icomp", "init", "sessions", "props",
-    "vars", "styles", "update",
+    "vars", "styles", "update", "set", "bind",
 }
 
 # Options that belong to the parser itself rather than to a subcommand, and
@@ -287,6 +287,299 @@ NODE_FIELDS_JS = (
 #
 # Defaults are not printed unless --all: `constraints MIN/MIN`, `opacity 1` and
 # `rotation 0` are on every node in the file and mean nothing.
+MUTATE_JS = r"""
+const MODE = __MODE__;          // 'set' — literal values; 'bind' — token names
+const DRY = __DRY__;
+const PAIRS = __PAIRS__;
+
+// `sel` means every selected layer, as in `rm`. Styling five layers in one call
+// is the whole point of the command; touching only the first and reporting
+// success is the kind of quiet wrong answer nobody re-reads.
+let targets;
+if (__ID__ === 'sel') {
+  targets = figma.currentPage.selection.slice();
+  if (!targets.length) throw new Error('nothing selected in Figma');
+} else {
+  const one = await h.resolve(__ID__);
+  if (!one) throw new Error('node not found: ' + __ID__);
+  targets = [one];
+}
+
+const round = (v) => Math.round(v * 100) / 100;
+const num = (v) => (v === undefined || v === null || typeof v === 'symbol')
+  ? '—' : String(round(v));
+const hex = (c) => '#' + [c.r, c.g, c.b]
+  .map((v) => ('0' + Math.round(v * 255).toString(16)).slice(-2)).join('').toUpperCase();
+
+const numOr = (raw, what) => {
+  const v = Number(raw);
+  if (!isFinite(v)) throw new Error(what + ' expects a number, got ' + JSON.stringify(raw));
+  return v;
+};
+const listOf = (raw, counts, what) => {
+  const parts = String(raw).split(',').map((p) => numOr(p.trim(), what));
+  if (counts.indexOf(parts.length) === -1) {
+    throw new Error(what + ' expects ' + counts.join(' or ') + ' numbers, got ' + parts.length);
+  }
+  return parts;
+};
+
+// "#rrggbb", "#rgb", "#rrggbb@50", "none"
+const paintOf = (raw) => {
+  if (raw === 'none') return [];
+  const at = String(raw).indexOf('@');
+  if (at === -1) return h.solid(raw);
+  return h.solid(raw.slice(0, at), numOr(raw.slice(at + 1), 'opacity') / 100);
+};
+const paintText = (node, prop) => {
+  const paints = node[prop];
+  if (typeof paints === 'symbol') return 'mixed';
+  if (!Array.isArray(paints) || !paints.length) return 'none';
+  const p = paints[0];
+  if (p.type !== 'SOLID') return p.type.toLowerCase();
+  const op = (p.opacity === undefined || p.opacity === 1) ? '' : '@' + Math.round(p.opacity * 100);
+  return hex(p.color) + op + (paints.length > 1 ? ' +' + (paints.length - 1) : '');
+};
+
+const CORNERS = ['topLeftRadius', 'topRightRadius', 'bottomRightRadius', 'bottomLeftRadius'];
+const SIDES = ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft'];
+const collapse = (v) => {
+  if (v[0] === v[1] && v[1] === v[2] && v[2] === v[3]) return String(round(v[0]));
+  if (v[0] === v[2] && v[1] === v[3]) return round(v[0]) + ',' + round(v[1]);
+  return v.map(round).join(',');
+};
+
+// Sizing on an axis: a number pins it, `fill` and `hug` are the auto-layout
+// modes, which Figma exposes as a different property entirely.
+const sizeOf = (node, axis) => {
+  const mode = axis === 'H' ? node.layoutSizingHorizontal : node.layoutSizingVertical;
+  const px = axis === 'H' ? node.width : node.height;
+  return mode && mode !== 'FIXED' ? mode.toLowerCase() : num(px);
+};
+const setSize = (node, axis, raw) => {
+  const word = String(raw).toLowerCase();
+  if (word === 'fill' || word === 'hug') {
+    const prop = axis === 'H' ? 'layoutSizingHorizontal' : 'layoutSizingVertical';
+    node[prop] = word.toUpperCase();
+    return;
+  }
+  const v = numOr(raw, axis === 'H' ? 'w' : 'h');
+  node.resize(axis === 'H' ? v : node.width, axis === 'H' ? node.height : v);
+};
+
+// Applied in a fixed order regardless of the order they were typed in:
+// auto-layout silently drops sizing and spacing set before layoutMode.
+const RANK = {
+  layout: 0, w: 1, h: 1, gap: 2, pad: 2, padTop: 2, padRight: 2,
+  padBottom: 2, padLeft: 2, align: 3,
+};
+
+const KEYS = {
+  name:    { read: (n) => n.name, write: (n, v) => { n.name = v; }, show: (v) => v },
+  text:    { read: (n) => n.type === 'TEXT' ? n.characters : '—',
+             write: async (n, v) => {
+               if (n.type !== 'TEXT') throw new Error('text: not a TEXT node (got ' + n.type + ')');
+               await h.setText(n, v);
+             }, show: (v) => v },
+  fill:    { read: (n) => paintText(n, 'fills'),
+             write: (n, v) => { n.fills = paintOf(v); },
+             show: (v) => v === 'none' ? 'none' : paintText({ fills: paintOf(v) }, 'fills') },
+  stroke:  { read: (n) => paintText(n, 'strokes'),
+             write: (n, v) => { n.strokes = paintOf(v); },
+             show: (v) => v === 'none' ? 'none' : paintText({ strokes: paintOf(v) }, 'strokes') },
+  sw:      { read: (n) => num(n.strokeWeight),
+             write: (n, v) => { n.strokeWeight = numOr(v, 'sw'); } },
+  radius:  { read: (n) => collapse(CORNERS.map((c) => n[c])),
+             write: (n, v) => {
+               const p = listOf(v, [1, 4], 'radius');
+               if (p.length === 1) n.cornerRadius = p[0];
+               else CORNERS.forEach((c, i) => { n[c] = p[i]; });
+             },
+             show: (v) => {
+               const p = listOf(v, [1, 4], 'radius');
+               return p.length === 1 ? String(round(p[0])) : collapse(p);
+             } },
+  gap:     { read: (n) => num(n.itemSpacing),
+             write: (n, v) => { n.itemSpacing = numOr(v, 'gap'); } },
+  pad:     { read: (n) => collapse(SIDES.map((s) => n[s])),
+             write: (n, v) => {
+               const p = listOf(v, [1, 2, 4], 'pad');
+               const four = p.length === 1 ? [p[0], p[0], p[0], p[0]]
+                          : p.length === 2 ? [p[0], p[1], p[0], p[1]] : p;
+               SIDES.forEach((s, i) => { n[s] = four[i]; });
+             } },
+  w:       { read: (n) => sizeOf(n, 'H'), write: (n, v) => setSize(n, 'H', v) },
+  h:       { read: (n) => sizeOf(n, 'V'), write: (n, v) => setSize(n, 'V', v) },
+  x:       { read: (n) => num(n.x), write: (n, v) => { n.x = numOr(v, 'x'); } },
+  y:       { read: (n) => num(n.y), write: (n, v) => { n.y = numOr(v, 'y'); } },
+  opacity: { read: (n) => num(n.opacity),
+             write: (n, v) => {
+               const s = String(v).trim();
+               const pct = s.slice(-1) === '%';
+               n.opacity = pct ? numOr(s.slice(0, -1), 'opacity') / 100 : numOr(s, 'opacity');
+             } },
+  visible: { read: (n) => String(n.visible),
+             write: (n, v) => {
+               const s = String(v).toLowerCase();
+               if (s !== 'true' && s !== 'false') throw new Error('visible expects true or false');
+               n.visible = s === 'true';
+             } },
+  layout:  { read: (n) => !n.layoutMode ? '—'
+               : (n.layoutMode === 'NONE' ? 'none'
+                  : n.layoutMode[0].toLowerCase() + (n.layoutWrap === 'WRAP' ? ' wrap' : '')),
+             write: (n, v) => {
+               const s = String(v).toLowerCase();
+               if (s === 'wrap') { n.layoutMode = 'HORIZONTAL'; n.layoutWrap = 'WRAP'; return; }
+               if (s !== 'v' && s !== 'h' && s !== 'none') {
+                 throw new Error('layout expects v, h, none or wrap, got ' + JSON.stringify(v));
+               }
+               n.layoutMode = s === 'v' ? 'VERTICAL' : s === 'h' ? 'HORIZONTAL' : 'NONE';
+             } },
+  align:   { read: (n) => n.layoutMode && n.layoutMode !== 'NONE'
+               ? n.primaryAxisAlignItems + '/' + n.counterAxisAlignItems : '—',
+             write: (n, v) => {
+               const parts = String(v).toUpperCase().split('/');
+               if (parts.length !== 2) throw new Error('align expects PRIMARY/COUNTER, e.g. CENTER/MIN');
+               n.primaryAxisAlignItems = parts[0];
+               n.counterAxisAlignItems = parts[1];
+             } },
+};
+
+// What `bind` may attach a variable to, and under which Figma property name.
+// Paints are their own API — setBoundVariableForPaint, not setBoundVariable —
+// and confusing the two is the first entry in the bridge's error hints.
+const BINDABLE = {
+  fill: 'paint:fills', stroke: 'paint:strokes',
+  sw: 'strokeWeight', gap: 'itemSpacing',
+  pad: SIDES, padTop: 'paddingTop', padRight: 'paddingRight',
+  padBottom: 'paddingBottom', padLeft: 'paddingLeft',
+  radius: CORNERS, radiusTL: 'topLeftRadius', radiusTR: 'topRightRadius',
+  radiusBR: 'bottomRightRadius', radiusBL: 'bottomLeftRadius',
+  w: 'width', h: 'height', opacity: 'opacity', text: 'characters',
+};
+
+const varNames = {};
+const varName = async (id) => {
+  if (varNames[id] === undefined) {
+    let name = id;
+    try { const v = await figma.variables.getVariableByIdAsync(id); if (v) name = v.name; } catch (e) {}
+    varNames[id] = name;
+  }
+  return varNames[id];
+};
+
+// The token currently attached to a key, so that "before" carries it too.
+const boundName = async (node, key) => {
+  const spec = BINDABLE[key];
+  if (!spec) return '';
+  if (String(spec).indexOf('paint:') === 0) {
+    const paints = node[spec.slice(6)];
+    if (typeof paints === 'symbol' || !Array.isArray(paints) || !paints[0]) return '';
+    const b = paints[0].boundVariables && paints[0].boundVariables.color;
+    return b && b.id ? ' → ' + await varName(b.id) : '';
+  }
+  const prop = Array.isArray(spec) ? spec[0] : spec;
+  const b = node.boundVariables && node.boundVariables[prop];
+  const one = Array.isArray(b) ? b[0] : b;
+  return one && one.id ? ' → ' + await varName(one.id) : '';
+};
+
+const bindOne = async (node, key, value) => {
+  const spec = BINDABLE[key];
+  if (!spec) {
+    throw new Error('bind: ' + key + ' is not bindable — one of: ' +
+      Object.keys(BINDABLE).join(', '));
+  }
+  const clearing = value === 'none';
+  if (String(spec).indexOf('paint:') === 0) {
+    const which = spec.slice(6);
+    if (clearing) {
+      const copy = JSON.parse(JSON.stringify(node[which]));
+      if (!copy[0]) throw new Error(key + ': nothing to unbind');
+      copy[0] = figma.variables.setBoundVariableForPaint(copy[0], 'color', null);
+      node[which] = copy;
+      return null;
+    }
+    return which === 'fills' ? await h.bF(node, 0, value) : await h.bS(node, 0, value);
+  }
+  const props = Array.isArray(spec) ? spec : [spec];
+  if (clearing) {
+    for (const p of props) node.setBoundVariable(p, null);
+    return null;
+  }
+  const v = await h.var_(value);
+  if (!v) {
+    throw new Error('bind: no variable named ' + JSON.stringify(value) +
+      ' — see what exists: figmosha vars ' + String(value).split('/').pop());
+  }
+  for (const p of props) node.setBoundVariable(p, v);
+  return v;
+};
+
+// ── apply, node by node ───────────────────────────────────────────────────
+const ordered = PAIRS.slice().sort((a, b) =>
+  (RANK[a[0]] === undefined ? 4 : RANK[a[0]]) - (RANK[b[0]] === undefined ? 4 : RANK[b[0]]));
+
+for (const [key] of ordered) {
+  const known = MODE === 'bind' ? BINDABLE[key] : KEYS[key];
+  if (!known) {
+    throw new Error('unknown key ' + JSON.stringify(key) + ' — one of: ' +
+      Object.keys(MODE === 'bind' ? BINDABLE : KEYS).join(', '));
+  }
+}
+
+// Reading a key is the same question in both modes; only writing differs.
+const readerFor = (key) => {
+  if (KEYS[key]) return KEYS[key].read;
+  const spec = BINDABLE[key];
+  if (String(spec).indexOf('paint:') === 0) return (n) => paintText(n, spec.slice(6));
+  const prop = Array.isArray(spec) ? spec[0] : spec;
+  return (n) => num(n[prop]);
+};
+
+const out = [];
+const label = (s) => (s + '            ').slice(0, 10);
+
+for (const node of targets) {
+  out.push(node.id + '  ' + node.name + ' [' + node.type + ']');
+  let quiet = 0;
+  for (const [key, value] of ordered) {
+    const reader = readerFor(key);
+    let before;
+    try { before = reader(node) + await boundName(node, key); }
+    catch (e) { before = '—'; }
+    try {
+      if (DRY) {
+        // The diff is worth printing even unapplied, but a bound value is not
+        // knowable until the variable is attached — so it is shown as the token
+        // in parentheses rather than guessed at.
+        const after = MODE === 'bind'
+          ? (value === 'none' ? '(unbound)' : '(' + value + ')')
+          : (KEYS[key].show ? KEYS[key].show(value) : String(value));
+        if (after === before) { quiet++; continue; }
+        out.push('  ' + label(key) + before + '  →  ' + after);
+        continue;
+      }
+      if (MODE === 'bind') await bindOne(node, key, value);
+      else await KEYS[key].write(node, value);
+
+      const after = reader(node) + await boundName(node, key);
+      if (after === before) { quiet++; continue; }
+      out.push('  ' + label(key) + before + '  →  ' + after);
+    } catch (e) {
+      // One node missing auto-layout must not cancel the other four: losing the
+      // whole command to one bad target is exactly the wasted turn this command
+      // exists to avoid.
+      out.push('  ' + label(key) + '! ' + String(e.message).split('\n')[0]);
+    }
+  }
+  if (quiet) out.push('  ' + quiet + ' unchanged');
+}
+if (DRY) out.push('(--dry-run: nothing was written)');
+return out.join('\n');
+"""
+
+
 PROPS_JS = r"""
 const n = await h.resolve(__ID__);
 if (!n) throw new Error('node not found: ' + __ID__);
@@ -1141,6 +1434,37 @@ def cmd_text(args):
     return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
 
 
+def _mutate(args, mode):
+    """set and bind are one program: same targets, same order, same diff.
+
+    Two commands rather than one flag, because what stands on the right differs
+    — a literal against a token name — and so does the way each is undone. A
+    merged command would have to guess which the caller meant.
+    """
+    pairs = []
+    for kv in args.pairs:
+        if "=" not in kv:
+            print(f"figmosha: expected key=value, got {kv!r}", file=sys.stderr)
+            return 2
+        k, v = kv.split("=", 1)
+        pairs.append([k.strip(), v.strip()])
+
+    code = (MUTATE_JS
+            .replace("__ID__", json.dumps(args.node_id))
+            .replace("__PAIRS__", json.dumps(pairs))
+            .replace("__MODE__", json.dumps(mode))
+            .replace("__DRY__", "true" if args.dry_run else "false"))
+    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+
+
+def cmd_set(args):
+    return _mutate(args, "set")
+
+
+def cmd_bind(args):
+    return _mutate(args, "bind")
+
+
 def cmd_variant(args):
     props = {}
     for kv in args.props:
@@ -1306,6 +1630,14 @@ def build_parser():
     p_text.add_argument("node_id")
     p_text.add_argument("text")
 
+    for name, helptext in (("set", "literal values"), ("bind", "variable names")):
+        p = sub.add_parser(name)
+        _add_common_flags(p)
+        p.add_argument("node_id", help="node id, `page`, or `sel` (the whole selection)")
+        p.add_argument("pairs", nargs="+", metavar="key=value", help=helptext)
+        p.add_argument("--dry-run", action="store_true",
+                       help="print the same diff without writing anything")
+
     p_variant = sub.add_parser("variant")
     _add_common_flags(p_variant)
     p_variant.add_argument("node_id")
@@ -1372,6 +1704,8 @@ def main():
         "exec": cmd_exec,
         "tree": cmd_tree,
         "find": cmd_find,
+        "set": cmd_set,
+        "bind": cmd_bind,
         "text": cmd_text,
         "variant": cmd_variant,
         "clone": cmd_clone,

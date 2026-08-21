@@ -208,6 +208,207 @@ def test_rm_reports_the_ids_it_could_not_find(monkeypatch):
     assert "9:9" in out.stdout and "removed 1" in out.stdout
 
 
+
+# ─── set / bind ───────────────────────────────────────────────────────────
+#
+# A richer stub than the one above: these commands write, so the document has
+# to push back the way Figma does — auto-layout properties refuse to be set
+# before layoutMode, and paints are frozen.
+
+MUTATE_STUB = """
+const order = [];
+const solid = (hex, op) => {
+  const n = parseInt(String(hex).replace('#',''), 16);
+  const p = {type:'SOLID', color:{r:((n>>16)&255)/255, g:((n>>8)&255)/255, b:(n&255)/255}};
+  if (op != null) p.opacity = op;
+  return [p];
+};
+function makeNode(over) {
+  const base = {
+    id:'1:2', name:'Card', type:'FRAME',
+    width:100, height:50, x:0, y:0, opacity:1, visible:true,
+    fills: solid('#ffffff'), strokes: [], strokeWeight: 1,
+    layoutMode:'NONE', layoutWrap:'NO_WRAP', itemSpacing:0,
+    paddingTop:0, paddingRight:0, paddingBottom:0, paddingLeft:0,
+    topLeftRadius:0, topRightRadius:0, bottomRightRadius:0, bottomLeftRadius:0,
+    primaryAxisAlignItems:'MIN', counterAxisAlignItems:'MIN',
+    layoutSizingHorizontal:'FIXED', layoutSizingVertical:'FIXED',
+    boundVariables:{},
+    resize(w, h) { order.push('resize'); this.width = w; this.height = h; },
+    setBoundVariable(prop, v) {
+      order.push('setBoundVariable:' + prop);
+      if (v) this.boundVariables[prop] = {id: v.id};
+      else delete this.boundVariables[prop];
+    },
+  };
+  const n = Object.assign(base, over || {});
+  return new Proxy(n, {
+    set(t, k, v) {
+      // Figma ignores spacing and padding on a frame with no auto-layout, and
+      // throws on the sizing modes. The stub throws for both, so a test can
+      // tell that the command reported the refusal instead of swallowing it.
+      const needsLayout = ['itemSpacing','paddingTop','paddingRight','paddingBottom','paddingLeft'];
+      if (needsLayout.indexOf(String(k)) !== -1 && t.layoutMode === 'NONE') {
+        throw new Error(String(k) + ' is only available on an auto-layout frame');
+      }
+      if (typeof v !== 'function') order.push(String(k));
+      t[k] = v;
+      return true;
+    },
+  });
+}
+const nodes = [makeNode({}), makeNode({id:'1:3', name:'Card 2'})];
+const VARS = {
+  'space/md': {id:'VariableID:9:1', name:'space/md'},
+  'color/bg': {id:'VariableID:9:2', name:'color/bg'},
+};
+const figma = {
+  currentPage: {
+    selection: nodes, id:'page', name:'Page 1', type:'PAGE',
+    findAll: (f) => nodes.filter(f),
+  },
+  getNodeByIdAsync: async (id) => nodes.find(n => n.id === id) || null,
+  variables: {
+    getVariableByIdAsync: async (id) => {
+      for (const k in VARS) if (VARS[k].id === id) return VARS[k];
+      return null;
+    },
+    setBoundVariableForPaint(paint, field, v) {
+      order.push('setBoundVariableForPaint:' + field);
+      const copy = JSON.parse(JSON.stringify(paint));
+      if (v) copy.boundVariables = {[field]: {id: v.id, type:'VARIABLE_ALIAS'}};
+      else if (copy.boundVariables) delete copy.boundVariables[field];
+      return copy;
+    },
+  },
+};
+const h = {
+  resolve: async (x) => x === 'page' ? figma.currentPage
+    : x === 'sel' ? figma.currentPage.selection[0]
+    : await figma.getNodeByIdAsync(x),
+  solid,
+  var_: async (name) => VARS[name] || null,
+  setText: async (n, t) => { order.push('setText'); n.characters = t; },
+  bF: async (n, i, name) => {
+    const v = VARS[name];
+    if (!v) throw new Error('h.bF: no variable named "' + name + '"');
+    const copy = JSON.parse(JSON.stringify(n.fills));
+    copy[i] = figma.variables.setBoundVariableForPaint(copy[i], 'color', v);
+    n.fills = copy;
+    return v;
+  },
+  bS: async (n, i, name) => {
+    const v = VARS[name];
+    const copy = JSON.parse(JSON.stringify(n.strokes));
+    copy[i] = figma.variables.setBoundVariableForPaint(copy[i], 'color', v);
+    n.strokes = copy;
+    return v;
+  },
+};
+"""
+
+
+def run_mutation(code):
+    """Run a set/bind program and hand back its text plus what it touched."""
+    program = (MUTATE_STUB + "(async () => {" + code + "})()"
+               ".then(text => console.log(JSON.stringify({text, order, "
+               "nodes: nodes.map(n => ({name:n.name, gap:n.itemSpacing, "
+               "fills:n.fills, bound:n.boundVariables, w:n.width, "
+               "layout:n.layoutMode}))})))"
+               ".catch(e => { console.error(e.message); process.exit(1); });")
+    out = subprocess.run([NODE, "-e", program], capture_output=True, text=True,
+                         encoding="utf-8")
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def mutation(monkeypatch, *argv):
+    seen = captured(monkeypatch)
+    args = parse(*argv)
+    (figmosha.cmd_bind if argv[0] == "bind" else figmosha.cmd_set)(args)
+    return run_mutation(seen["code"])
+
+
+@needs_node
+def test_set_applies_layout_before_spacing(monkeypatch):
+    """Typed in the wrong order on purpose: auto-layout silently drops
+    itemSpacing set before layoutMode, so the command must reorder."""
+    r = mutation(monkeypatch, "set", "1:2", "gap=16", "layout=v")
+    assert r["order"].index("layoutMode") < r["order"].index("itemSpacing")
+    assert r["nodes"][0]["gap"] == 16
+
+
+@needs_node
+def test_set_reports_a_refusal_per_key_and_keeps_going(monkeypatch):
+    """One key the node cannot take must not cost the whole command."""
+    r = mutation(monkeypatch, "set", "1:2", "gap=16", "name=Renamed")
+    assert "auto-layout" in r["text"]
+    assert r["nodes"][0]["name"] == "Renamed"
+
+
+@needs_node
+def test_set_sel_writes_every_selected_node(monkeypatch):
+    r = mutation(monkeypatch, "set", "sel", "name=Both")
+    assert [n["name"] for n in r["nodes"]] == ["Both", "Both"]
+
+
+@needs_node
+def test_set_prints_before_and_after(monkeypatch):
+    r = mutation(monkeypatch, "set", "1:2", "fill=#f5f5f5")
+    assert "#FFFFFF" in r["text"] and "#F5F5F5" in r["text"] and "→" in r["text"]
+
+
+@needs_node
+def test_set_counts_unchanged_instead_of_listing_them(monkeypatch):
+    r = mutation(monkeypatch, "set", "1:2", "name=Card", "x=0")
+    assert "2 unchanged" in r["text"]
+
+
+@needs_node
+def test_dry_run_writes_nothing(monkeypatch):
+    r = mutation(monkeypatch, "set", "1:2", "name=Renamed", "--dry-run")
+    assert r["nodes"][0]["name"] == "Card"
+    assert "Renamed" in r["text"] and "--dry-run" in r["text"]
+
+
+@needs_node
+def test_bind_paint_goes_through_the_paint_api(monkeypatch):
+    """setBoundVariable on fills is the error the bridge hints about first."""
+    r = mutation(monkeypatch, "bind", "1:2", "fill=color/bg")
+    assert "setBoundVariableForPaint:color" in r["order"]
+    assert not any(o.startswith("setBoundVariable:") for o in r["order"])
+
+
+@needs_node
+def test_bind_number_names_the_token_in_the_diff(monkeypatch):
+    r = mutation(monkeypatch, "bind", "1:2", "gap=space/md")
+    assert r["nodes"][0]["bound"]["itemSpacing"]["id"] == "VariableID:9:1"
+    assert "space/md" in r["text"]
+
+
+@needs_node
+def test_bind_none_unbinds(monkeypatch):
+    r = mutation(monkeypatch, "bind", "1:2", "gap=space/md", "gap=none")
+    assert "itemSpacing" not in r["nodes"][0]["bound"]
+
+
+@needs_node
+def test_bind_refuses_a_key_that_is_not_bindable(monkeypatch):
+    seen = captured(monkeypatch)
+    figmosha.cmd_bind(parse("bind", "1:2", "visible=space/md"))
+    program = (MUTATE_STUB + "(async () => {" + seen["code"] + "})()"
+               ".then(() => process.exit(1))"
+               ".catch(e => console.log(e.message));")
+    out = subprocess.run([NODE, "-e", program], capture_output=True, text=True,
+                         encoding="utf-8")
+    assert "not bindable" in out.stdout or "unknown key" in out.stdout
+
+
+def test_set_rejects_an_argument_without_an_equals_sign(monkeypatch, capsys):
+    captured(monkeypatch)
+    assert figmosha.cmd_set(parse("set", "1:2", "gap")) == 2
+    assert "key=value" in capsys.readouterr().err
+
 # ─── doctor ───────────────────────────────────────────────────────────────
 
 def test_doctor_reads_the_file_it_reports(monkeypatch, capsys):

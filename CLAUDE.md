@@ -81,6 +81,8 @@ Rules that follow from how Figma works, not from Figmosha:
 | `figmosha tree <id> [--depth N] [--layout]` | Explore structure |
 | `figmosha find <id> name=Button` | Locate by exact name (`name~Btn` = substring) |
 | `figmosha find <id> type=INSTANCE` | Filter by type (also `text=`, `text~`) |
+| `figmosha set <id> gap=16 fill=#f5f5f5` | Change literal values — the alternative to a hand-written exec |
+| `figmosha bind <id> gap=space/md fill=surface/bg` | Bind the same keys to variables **by token name** |
 | `figmosha text <id> "новий"` | Edit text, fonts loaded for you |
 | `figmosha variant <id> "Property 1=Default"` | Switch variant |
 | `figmosha clone <id> --right --gap 100` | Duplicate adjacent |
@@ -90,7 +92,33 @@ Rules that follow from how Figma works, not from Figmosha:
 | `figmosha update` | `git pull` **and** stamp the project's port and plugin id back into the plugin — one step instead of three, and it names the right follow-up (re-Run vs re-Import) |
 
 Anywhere an id is taken, `page` and `sel` work too — `figmosha tree sel --layout`
-dumps the selected subtree without hunting for its id first.
+dumps the selected subtree without hunting for its id first. In `set`, `bind`
+and `rm`, `sel` means the **whole** selection, not its first node.
+
+### `set` / `bind` — the keys
+
+```
+set   name text fill stroke sw radius gap pad w h x y opacity visible layout align
+bind  fill stroke sw gap pad(+padTop…padLeft) radius(+radiusTL…radiusBL) w h opacity text
+```
+
+`fill=#rrggbb@50` and `fill=none`; `pad=n | v,h | t,r,b,l`; `w=fill|hug|<число>`;
+`align=CENTER/MIN`; `layout=v|h|none|wrap`. In `bind`, a value of `none` removes
+the binding. Keys are applied in a fixed order (layout → size → spacing → align),
+not in the order typed, because auto-layout drops whatever is set too early.
+
+Every mutation prints **before → after**, and a second arrow names the token:
+
+```
+94:12  QA-card [FRAME]
+  gap       16  →  8 → spacing/sp-4
+  radius    ! bind: no variable named «radius/rounded-md» — see: figmosha vars rounded-md
+```
+
+A key the node refuses is one line, not a failed command — the other keys and
+the other nodes still go through. `--dry-run` prints the same table and writes
+nothing. That output is the only undo there is: Figma's own history is not
+reachable from here, so a value you may want back has to be read off the diff.
 
 When the user says "this frame" or "the selected one", call `figmosha sel` —
 don't ask them to find an id by hand.

@@ -317,6 +317,8 @@ new Function("figma", "print", "h", `return (async () => { <YOUR CODE> })();`)(f
 | `await h.bS(node, idx, var)` | Bind stroke paint to a variable |
 | `await h.bN(node, prop, var)` | Bind numeric prop (radius, padding, size, itemSpacing, …) |
 | `await h.applyStyle(node, kind, name)` | Apply a style — `fill`, `stroke`, `text`, `effect`, `grid` |
+
+See also the `set` and `bind` commands, which cover the same ground without a script.
 | `h.findByName(root, name)` | First descendant with exact name |
 | `h.findAllByName(root, name)` | All descendants with exact name |
 | `h.dumpTree(node, {maxDepth, showSize, showText, showLayout})` | Indented tree string |
