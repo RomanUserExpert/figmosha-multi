@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy to file-keys.json. Maps the Figma file NAME the bridge reports to its file key, which figma.fileKey cannot give a development plugin. The key is what makes _meta.figmaUrl resolve. Find it in the URL: figma.com/design/<KEY>/<name>. This file is per project and gitignored.",
+  "My Design System": "AbC123ExampleKeyXyz",
+  "My Icons": "Def456ExampleKeyUvw"
+}

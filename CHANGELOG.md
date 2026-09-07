@@ -9,6 +9,58 @@ code it started with, so new helpers won't exist until you do. If
 `plugin/manifest.json` changed, re-*import* it rather than just re-running, and
 re-run `figmosha init` so the copy's project identity survives the update.
 
+## [Unreleased]
+
+### uSpec runs on the bridge — `uspec/`
+
+**uSpec** documents a Figma component: it reads a component set out of the file,
+writes a Markdown spec, and renders seven annotation frames — anatomy, structure,
+property, color, API, motion, screen reader — back beside the component. Stock
+uSpec needs two things to do it: its own **Extract plugin**, and a **Figma MCP
+server** for every write. Both exist to execute JavaScript inside the open file.
+That is what `POST /exec` has always been, so neither is necessary here.
+
+`uspec/` is the adapter. It makes `figmosha` a third `mcpProvider`, and the whole
+pipeline — extraction, spec, contract, all seven renders — runs over the bridge.
+Nothing in uSpec is forked: `npx uspec-skills init` installs the skills
+unmodified and `uspec/apply-adapter.py` patches them in place afterwards, four
+marked substitutions per tree, idempotent, re-runnable after every upgrade.
+`--check` reports an unpatched tree and exits non-zero, so an upstream move
+surfaces as `UNPATCHED` rather than as nothing.
+
+Three things were worth the trouble to get right:
+
+- **Extraction is read-only.** uSpec's phases F and G instantiate every variant
+  to measure it and then delete the instances. Under an MCP that write belongs to
+  a plugin the designer ran; here it would be the agent's, into the designer's
+  file, unasked. `extract/build-bundle.mjs` patches both phases at build time to
+  measure in place, anchored on exact source text so an upstream move fails the
+  build instead of passing silently. The cost is bounded and the output declares
+  it in `_extractionNotes.warnings`: nothing at all without BOOLEANs or SLOTs, and
+  otherwise only the reflowed geometry in `crossVariant.axisDiffs`. `--reveal`
+  restores the full measurement on **temporary instances** and verifies the file
+  came back to where it started before it will finish.
+
+- **The templates are captured, not imported.** The render skills import a
+  template component by key from an unpublished Community file. That key does not
+  reject — it **hangs and never settles**, 15–24 s to a timeout, seven for seven.
+  Publication status is the discriminator, not connection warmth, and a longer
+  timeout does not help. So the seven templates are read out node-for-node into
+  `templates/templates.json` (330 nodes, 147 `#anchor` layers) and replayed as a
+  detached frame on demand. The skills detach the imported instance on the next
+  line anyway, so nothing downstream can tell.
+
+- **The port is not written down twice.** Every script in `uspec/` takes its
+  default `--port` from this copy's `project.json`, the same number the bridge
+  binds.
+
+`uspec/file-keys.json` (gitignored, `file-keys.example.json` is the template) maps
+a Figma file's name to its key — a development plugin cannot read `figma.fileKey`,
+and `_meta.figmaUrl` needs it.
+
+Proven end to end against a copy of a real design-system library. Full write-up in
+[`uspec/README.md`](uspec/README.md).
+
 ## [2.4.0] — 2026-08-21
 
 2.3 made output cheap. The unit left unoptimised was the **agent's turn** —

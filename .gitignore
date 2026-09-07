@@ -29,3 +29,12 @@ CLAUDE.local.md
 # A copy's project identity: it belongs to the folder it was initialized in,
 # never to the repo. The zero copy has none, which is what makes it zero.
 project.json
+
+# The uSpec file-key map: which Figma file name carries which file key. Same kind
+# of thing as project.json — it belongs to the copy, not to the repo, and a key
+# committed here would follow the tool into every other project.
+uspec/file-keys.json
+
+# The extraction bundle is built from a pinned uSpec commit by
+# uspec/extract/build-bundle.mjs. A build output, not source.
+uspec/extract/uspec-extract.bundle.js

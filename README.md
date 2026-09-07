@@ -97,6 +97,23 @@ Splitting build from bind is the recommended shape for anything non-trivial:
 each half is verifiable on its own, and a failure in the second doesn't leave
 you guessing which half broke.
 
+### Document a component with uSpec
+
+[`uspec/`](uspec/README.md) runs **uSpec** — the component-documentation pipeline that
+extracts a component set, writes a Markdown spec, and renders seven annotation frames back
+into Figma — entirely over this bridge. Stock uSpec needs its own Extract plugin and a Figma
+MCP server; both exist to execute JavaScript in the open file, which is what `POST /exec`
+already is.
+
+```bash
+npx uspec-skills init                            # uSpec's skills, unmodified
+python uspec/apply-adapter.py --skills .claude/skills   # point them at Figmosha
+python uspec/extract/extract.py --set-id 86:9283 --out components/_base.json
+```
+
+Extraction is read-only — uSpec's measuring phases are patched at build time to measure
+variants in place rather than instantiate them, so reading a file never writes to it.
+
 ### What it can't do
 
 - **Anything outside the open file.** The plugin is bound to whichever Figma
@@ -412,6 +429,13 @@ plugin/
 tests/
   test_bridge.py       Bridge driven by a fake plugin over a real WebSocket
   helpers.test.js      Pure helpers against a stubbed Figma
+uspec/
+  README.md            uSpec component documentation, run over the bridge
+  adapter.md           the `figmosha` mcpProvider the patched uSpec skills follow
+  apply-adapter.py     patches an installed uSpec skill tree; --check guards a commit
+  extract/             _base.json without the uSpec Extract plugin, read-only
+  templates/           the seven annotation templates, captured and rebuilt on demand
+  docs/                why importComponentByKeyAsync hangs, and the ways out
 CLAUDE.md              Conventions for Claude Code sessions driving Figmosha
 CLAUDE.local.md        Your machine's paths and hosts — gitignored, never committed
 .claude/skills/        Task skills: component-builder, ds-review, handoff-spec, naming-audit
