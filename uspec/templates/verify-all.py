@@ -69,6 +69,9 @@ def post(port, code, consts, session, timeout, _tries=2):
 REMOVE = """
 const n = await figma.getNodeByIdAsync(FRAME_ID);
 if (!n) return { removed: false, reason: "already gone" };
+// Under documentAccess: dynamic-page, findAll on a node whose page nobody has
+// opened throws until the page is loaded.
+await h.loadPageOf(n);
 const c = n.findAll(() => true).length + 1;
 n.remove();
 return { removed: !(await figma.getNodeByIdAsync(FRAME_ID)), nodesRemoved: c };
@@ -78,6 +81,7 @@ SWEEP = """
 if (figma.root.name !== EXPECT_FILE) throw new Error("wrong file: " + figma.root.name);
 const c = await figma.getNodeByIdAsync(COMPONENT_NODE_ID);
 let p = c; while (p.parent && p.parent.type !== "DOCUMENT") p = p.parent;
+await h.loadPageOf(c);
 return { page: p.name, pageNodes: p.findAll(() => true).length, topLevel: p.children.length,
   leftovers: p.children.filter((x) => LEFTOVER_NAMES.indexOf(x.name) !== -1).map((x) => x.name) };
 """

@@ -58,7 +58,11 @@ const figma = {
   ui: { onmessage: null, postMessage(m) { posted.push(m); } },
   createFrame: makeFrame,
   currentPage: { selection: [] },
-  root: { name: "Stub" },
+  // root.children is readable without loading any page in either mode, which
+  // is what makes h.pages() the cheap way to split a scan.
+  root: { name: "Stub", children: [] },
+  // clientStorage is absent from this stub on purpose: the sid must still work
+  // when it is unavailable, which is what the try/catch around it is for.
   variables: {
     async getLocalVariablesAsync() { calls.listVars++; return VARIABLES; },
     async getLocalVariableCollectionsAsync() { return COLLECTIONS; },
@@ -251,24 +255,24 @@ async function throws(fn) {
     kid("0:2", "A", [kid("0:3", "B", [kid("0:4", "C", [kid("0:5", "D", [])])])]),
   ]);
 
-  const cut = h.dumpTree(deep, { maxDepth: 2 });
+  const cut = await h.dumpTree(deep, { maxDepth: 2 });
   check("depth stops where it was told", /C \[FRAME\]/.test(cut), false);
   check("and says how much it hid", /… \+2 deeper/.test(cut), true);
   check("full depth still walks everything",
-        /D \[FRAME\]/.test(h.dumpTree(deep, { maxDepth: 99 })), true);
+        /D \[FRAME\]/.test(await h.dumpTree(deep, { maxDepth: 99 })), true);
 
   const many = (n, name) => Array.from({ length: n }, (_, i) => kid("9:" + i, name));
-  const three = h.dumpTree(kid("9:9", "Row", many(30, "Item")), {});
+  const three = await h.dumpTree(kid("9:9", "Row", many(30, "Item")), {});
   check("identical siblings collapse to one row",
         (three.match(/Item \[FRAME\]/g) || []).length, 1);
   check("and the collapsed row counts them", /… 29 more siblings named the same/.test(three), true);
   check("with the id range spelled out", /\(9:1 … 9:29\)/.test(three), true);
 
-  const two = h.dumpTree(kid("9:9", "Row", many(2, "Item")), {});
+  const two = await h.dumpTree(kid("9:9", "Row", many(2, "Item")), {});
   check("a pair is not worth collapsing",
         (two.match(/Item \[FRAME\]/g) || []).length, 2);
 
-  const off = h.dumpTree(kid("9:9", "Row", many(30, "Item")), { collapse: false });
+  const off = await h.dumpTree(kid("9:9", "Row", many(30, "Item")), { collapse: false });
   check("--no-collapse lists them all",
         (off.match(/Item \[FRAME\]/g) || []).length, 30);
 
@@ -278,9 +282,148 @@ async function throws(fn) {
     { id: "9:3", name: "Item", type: "TEXT", characters: "x", width: 1, height: 1 },
   ]);
   check("type is part of the sameness",
-        (h.dumpTree(mixed, {}).match(/Item \[/g) || []).length, 3);
+        ((await h.dumpTree(mixed, {})).match(/Item \[/g) || []).length, 3);
+
+
+  // ── h.walk: the budget, the prune and the cursor ──────────────────────
+  // This is the primitive every scan is supposed to be built on, so what is
+  // pinned here is exactly what a scan depends on: it stops when told, it does
+  // not wander into instances, and it can be picked up again where it stopped.
+  const inst = (id, name, children) => ({
+    id, name, type: "INSTANCE", width: 10, height: 10, children: children || [],
+  });
+
+  const tree = kid("w:0", "Root", [
+    kid("w:1", "A", [kid("w:2", "A1"), kid("w:3", "A2")]),
+    inst("w:4", "Card", [kid("w:5", "inside"), kid("w:6", "inside2")]),
+    kid("w:7", "B"),
+  ]);
+
+  let seen = (await h.walk(tree, (n) => n.id)).found;
+  check("walk skips what arrived inside an instance",
+        seen, ["w:0", "w:1", "w:2", "w:3", "w:4", "w:7"]);
+
+  seen = (await h.walk(tree, (n) => n.id, { pruneInstances: false })).found;
+  check("…unless nested copies are the point",
+        seen, ["w:0", "w:1", "w:2", "w:3", "w:4", "w:5", "w:6", "w:7"]);
+
+  const capped = await h.walk(tree, (n) => n.id, { maxNodes: 2 });
+  check("maxNodes stops the walk", capped.partial, true);
+  check("and says why", capped.reason, "maxNodes");
+
+  // The cursor is the point of stopping early: a scan interrupted by a budget
+  // has to be resumable, or every overrun costs the whole subtree again.
+  let all = [];
+  let cursor = null;
+  for (let round = 0; round < 10; round++) {
+    const step = await h.walk(tree, (n) => n.id, { maxNodes: 2, cursor });
+    all = all.concat(step.found);
+    if (!step.partial) break;
+    cursor = step.cursor;
+  }
+  check("a resumed walk visits every node exactly once",
+        all, ["w:0", "w:1", "w:2", "w:3", "w:4", "w:7"]);
+
+  const deepWalk = await h.walk(tree, (n) => n.id, { maxDepth: 1 });
+  check("maxDepth applies to the walk too",
+        deepWalk.found, ["w:0", "w:1", "w:4", "w:7"]);
+
+  // An async visit is the normal case — h.mainOf is one — so it must be awaited
+  // rather than collected as a pile of pending promises.
+  const asyncSeen = await h.walk(tree, async (n) => n.name, { maxDepth: 1 });
+  check("an async visit is awaited", asyncSeen.found, ["Root", "A", "Card", "B"]);
+
+
+  // A walk may be given less than the whole exec's budget — several walks in
+  // one script, or time kept back for the writing that follows.
+  const slow = kid("s:0", "Root", Array.from({ length: 900 }, (_, i) => kid("s:" + i, "N")));
+  const budgeted = await h.walk(slow, (n) => {
+    const stop = Date.now() + 2;        // 2ms a node: 900 of them cannot fit in 20ms
+    while (Date.now() < stop) {}
+    return n.id;
+  }, { budgetMs: 20 });
+  check("budgetMs stops a walk early", budgeted.partial, true);
+  check("and names the budget as the reason", budgeted.reason, "deadline");
+  check("and hands back where it stopped", budgeted.cursor.length > 0, true);
+
+
+  // A stride over this check would multiply the overshoot by the cost of the
+  // visit, and the visit is the expensive part of any real scan.
+  const wide = kid("t:0", "Root", Array.from({ length: 40 }, (_, i) => kid("t:" + i, "N")));
+  const t0 = Date.now();
+  const tight = await h.walk(wide, () => {
+    const stop = Date.now() + 5;
+    while (Date.now() < stop) {}
+  }, { budgetMs: 30 });
+  check("the budget is checked every node, not every Nth", tight.partial, true);
+  check("so the overshoot is one visit, not many", Date.now() - t0 < 80, true);
+
+  // ── h.mainOf: the expensive call, counted ─────────────────────────────
+  let resolves = 0;
+  const main = { id: "C:1", name: "Card", key: "abc" };
+  const instance = {
+    id: "i:1", type: "INSTANCE",
+    async getMainComponentAsync() { resolves++; return main; },
+  };
+  check("mainOf resolves the component", (await h.mainOf(instance)).name, "Card");
+  await h.mainOf(instance);
+  check("and asks Figma once per instance", resolves, 1);
+  check("a non-instance is null, not an error", await h.mainOf(kid("x", "F")), null);
+
+  // ── h.importComp: a call that can never settle ────────────────────────
+  const hung = new Promise(() => {});
+  figma.importComponentByKeyAsync = () => hung;
+  let importError = "";
+  try {
+    await h.importComp("deadbeef", { timeout: 30 });
+  } catch (e) { importError = e.message; }
+  check("a hung import fails instead of waiting forever",
+        /did not settle in/.test(importError), true);
+  check("and points at the way that does work",
+        /h\.mainOf/.test(importError), true);
+
+  // ── the exec handler: one at a time, and it says when it starts ───────
+  posted.length = 0;
+  await figma.ui.onmessage({ type: "exec", id: "q1", code: "return 1;" });
+  check("an exec announces that it started",
+        posted.filter((m) => m.type === "started" && m.id === "q1").length, 1);
+
+  // Two execs delivered without waiting for the first to finish must not
+  // interleave: they share CURRENT_PRINT and the per-exec caches.
+  posted.length = 0;
+  const first = figma.ui.onmessage({ type: "exec", id: "q2",
+    code: "print('a'); await new Promise(r => setTimeout(r, 20)); print('b'); return 1;" });
+  const second = figma.ui.onmessage({ type: "exec", id: "q3",
+    code: "print('c'); return 2;" });
+  await Promise.all([first, second]);
+  const order2 = posted.filter((m) => m.type === "log").map((m) => m.text);
+  check("a second exec waits for the first", order2, ["a", "b", "c"]);
+
+
+  // The budget the helpers see is the caller's, less a margin: a partial result
+  // that arrives after the caller gave up is the same as no result at all.
+  posted.length = 0;
+  await figma.ui.onmessage({ type: "exec", id: "q5", deadline_ms: 10000,
+    code: "return Math.round(h.left());" });
+  const left = Number(posted.filter((m) => m.type === "result" && m.id === "q5")[0].text);
+  check("the walking budget stops short of the caller's deadline",
+        left <= 9000 && left > 8500, true);
+
+  // ── the deadline lives inside the loop ────────────────────────────────
+  // Nothing outside the thread can stop a running script, so the only honest
+  // test is that a walk started with a spent budget gives up at once.
+  posted.length = 0;
+  await figma.ui.onmessage({
+    type: "exec", id: "q4", deadline_ms: 1,
+    code: "const t = {id: 'a', type: 'FRAME', children: [{id: 'b', type: 'FRAME', children: []}]};" +
+          "await new Promise(r => setTimeout(r, 10));" +
+          "const r = await h.walk(t, n => n.id); return r.partial + ' ' + r.reason;",
+  });
+  const out4 = posted.filter((m) => m.type === "result" && m.id === "q4")[0];
+  check("a walk past its deadline stops and says so", out4.text, "true deadline");
 
   // The caches are dropped by the exec handler itself, not only by hand.
+  posted.length = 0;
   clearExecCaches();
   calls.listVars = 0;
   await figma.ui.onmessage({ type: "exec", id: "t1", code: "return await h.var_('space/md');" });

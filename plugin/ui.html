@@ -48,6 +48,9 @@ const statusEl = document.getElementById("status");
 const iconEl = document.getElementById("icon");
 let ws = null;
 let reconnectTimer = null;
+// One new-sid attempt per rejection streak; cleared once we are connected, so
+// a later collision can try again.
+let sidRetried = false;
 
 // Who we are, as told by code.js: {sid, file, page}. The bridge routes by sid,
 // so connecting before we know it would land this document in the anonymous
@@ -97,6 +100,7 @@ function connect() {
   }
 
   ws.onopen = () => {
+    sidRetried = false;
     setStatus(fileLabel(), "ok");
     log("[ws] connected as " + (me ? me.sid : "anonymous"));
     try { ws.send(JSON.stringify(helloMessage())); } catch (e) {}
@@ -112,6 +116,9 @@ function connect() {
       log(`[exec] ${shortId(msg.id)} code=${(msg.code || "").length}b`);
       parent.postMessage({ pluginMessage: {
         type: "exec", id: msg.id, code: msg.code, want_value: msg.want_value,
+        // How long the caller is still prepared to wait. Nothing out here can
+        // stop a running script; the helpers on the other side check it.
+        deadline_ms: msg.deadline_ms,
       } }, "*");
     } else if (msg.type === "ping") {
       // Liveness probe: the bridge sends this when another plugin instance
@@ -127,9 +134,18 @@ function connect() {
 
   ws.onclose = (e) => {
     if (e && e.code === 1008) {
-      // Other files are welcome now — this can only be *this* document served
-      // twice, i.e. the same file open in a second Figma window. Retrying every
-      // 2s would just spam both sides.
+      // Two ways to get here. Either this document really is served twice (the
+      // same file open in a second Figma window), or two different files share
+      // a name and therefore share a stored sid. Ask code.js for a fresh id and
+      // retry at once: a collision clears immediately, and a genuine duplicate
+      // says 1008 again, at which point we fall back to waiting it out.
+      if (!sidRetried) {
+        sidRetried = true;
+        setStatus("Reconnecting…", "pending");
+        log("[ws] rejected: sid taken — asking for a new one");
+        parent.postMessage({ pluginMessage: { type: "newsid" } }, "*");
+        return;
+      }
       setStatus("File open twice", "err");
       log("[ws] rejected: this document already has a live plugin");
       reconnectTimer = setTimeout(connect, 15000);

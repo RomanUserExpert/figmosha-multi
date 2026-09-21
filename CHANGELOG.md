@@ -11,6 +11,128 @@ re-run `figmosha init` so the copy's project identity survives the update.
 
 ## [Unreleased]
 
+### Surviving a big file
+
+Everything here comes out of one measured run: a 15-page mockup file where one
+frame holds 53 439 instances, a scan resolved 876 849 main components, and the
+tab ran out of memory. The failure modes are written up in
+`figmosha-problems/README.md`; this is the answer to them.
+
+**Breaking.** Four changes, each with a migration:
+
+- `plugin/manifest.json` now declares `"documentAccess": "dynamic-page"`, so
+  Figma no longer preloads the entire document before the plugin's first line.
+  That preload was 20–30 s and most of an out-of-memory budget spent before a
+  single command had been sent. In exchange the synchronous lookups throw:
+  `instance.mainComponent`, `figma.getNodeById`, `component.instances`,
+  `getLocal*Styles`, `node.fillStyleId = …`, `figma.currentPage = …`,
+  `style.consumers`. The replacements are in `CLAUDE.md → Dynamic pages`, and
+  the bridge names them in a hint the first time a script trips over one.
+  **Re-import the plugin** (a manifest change is not picked up by a re-Run).
+  A project that is not ready: `figmosha init --document-access legacy`, which
+  sticks in `project.json`.
+- `figmosha find` no longer descends into instances. An instance's children are
+  copies that arrived with its component, not placements anyone made; in the
+  measured run 0 of 339 real hits were nested inside one. `--nested` restores
+  the old behaviour, `--count` skips building the list at all.
+- `find --raw` returns the walk — `{found, visited, pruned, partial, cursor}` —
+  rather than a bare array, because on a big subtree "were there more?" is the
+  difference between a short answer and a wrong one.
+- `h.findByName`, `h.findAllByName` and `h.dumpTree` are now `async`: they may
+  have to load the page they were handed. `await` them.
+
+**A caller's timeout is no longer mistaken for the plugin's.** A 504 used to
+release the file's lock while the abandoned script kept running inside Figma,
+so the next request was dispatched into a busy JS thread — which is how one
+overrun became minutes of a dead file, and twice an out-of-memory crash. The
+bridge now keeps abandoned requests in `Session.running`, waits for the thread,
+and refuses with `busy` instead of stacking. `GET /sessions` gained `busy`,
+`running_ms` and `orphaned`; `GET /status` gained `busy`. `pending` and
+`queued` never were busy signals and still are not.
+
+`POST /sessions/<sid>/reset` (`figmosha sessions --reset <sid>`) makes the
+bridge forget a wedged session. It cannot stop a running script — nothing can —
+and it is a last resort, not a retry.
+
+**The plugin runs one exec at a time and says when it starts.** A `started`
+message makes `ran_ms` mean what it says; before, it was time since dispatch.
+An internal queue stops two scripts interleaving at their `await` points and
+wiping each other's per-exec caches.
+
+**A deadline that lives inside the loop.** Figma cannot interrupt a running
+plugin script, so a limit only exists where the code checks it. The bridge
+passes the caller's remaining time to the plugin, and `h.walk` and friends stop
+between nodes and hand back a cursor.
+
+Two details of that, both found by running it against a real file rather than a
+stub, and both the difference between the mechanism working and merely
+existing:
+
+- The plugin stops **short** of the caller's deadline — 10% of the budget,
+  between 250 ms and 2 s — because a partial result that arrives after the 504
+  is the same as no result at all.
+- The budget is checked at **every** node, not every 256th. A stride looks like
+  a saving and is not: measured inside Figma, `Date.now()` costs 0.19 µs while
+  reading one node's `type` and `children` costs 17.63 µs, so checking always
+  adds about 1%. A stride, meanwhile, multiplies the overshoot by the cost of
+  the visit — and the visit is the expensive part of any real scan. At 10 ms a
+  node it walked 2.5 s past the deadline and the answer arrived too late.
+
+### New
+
+- `figmosha each <id> -f script.js --split N --state run.jsonl [--resume]` —
+  run one script over a subtree, a unit at a time. It descends before it runs
+  anything (listing children is free; discovering the right size after a
+  100-second overrun is not), writes one JSON line per unit as it finishes, and
+  splits a unit that times out instead of retrying it. `--resume` picks the run
+  back up. Long runs get `--wait-plugin` by default.
+
+  The listing that decides how to split a unit is asked with a generous budget
+  of its own, because the unit that just overran still owns the file's thread:
+  asking with the unit's own timeout hits the same busy plugin and reports
+  "cannot be split", which is a wrong answer to a question that was never
+  asked.
+- `h.walk(root, visit, opts)` — the way to cross a big subtree: prunes at
+  `INSTANCE` by default, checks the deadline between nodes, stops on
+  `budgetMs` / `maxNodes` / `maxHits`, and returns `{found, visited, pruned,
+  partial, cursor, reason}`. Feed the cursor back to carry on: over a real
+  page, 410 + 214 nodes across two separate `exec` calls is exactly the 624 a
+  single uninterrupted walk finds — no gaps, no repeats.
+- `h.mainOf(instance)` — the only supported route to a main component under
+  dynamic-page, with a per-exec cache and a counter that warns through
+  `print()` at 5 000 resolves, while the run can still be narrowed.
+- `h.loadPageOf(node)`, `h.pages()`, `h.tick()`, `h.left()`, `h.stats()`.
+- `--set-str NAME=value` and `--set-json NAME=value`. `--set` guesses — JSON
+  when it parses, a string when it does not — which makes
+  `--set KEYS='{"a":"b"}'` an object and throws inside any script that calls
+  `JSON.parse(KEYS)`. `--set-str` is the fix. `NAME=@file` reads the value from
+  a file, for key lists past the command-line length limit.
+- `--wait-plugin N` / `FIGMOSHA_WAIT_PLUGIN`: on a lost plugin, wait for it to
+  come back rather than failing. Switching files in Figma closes the plugin
+  window and takes every session with it, so a long run meets this.
+- Exit codes a runner can branch on: **1** script error · **2** usage ·
+  **3** no plugin · **4** timeout or busy. They used to all be 1.
+
+### Fixed
+
+- `h.importComp` / `h.importVar` race the import against a timer. Importing a
+  key that belongs to another file and was never published never settles — no
+  result, no error — and the 180 s in the field report was the CLI giving up,
+  not the API answering. `icomp` defaults to 20 s and points at the way that
+  works: compare `(await h.mainOf(inst)).key` from the consuming side.
+- `figmosha tree` no longer hides a full walk. The `… +N deeper` count called
+  `descendants()`, which walked every cut branch — so `tree --depth 1` on a
+  53 000-node frame walked all 53 000. It is bounded now, and says `≥N` when it
+  stops counting.
+- The session id survives a re-Run: it is kept in `figma.clientStorage`, keyed
+  by file name, so `--session` and a resumed run still find the same file after
+  the plugin is started again. Two same-named files in one account share the
+  key; the bridge refuses the second with 1008 and the plugin regenerates
+  immediately instead of waiting 15 s.
+- `CLAUDE.md` and `README.md` no longer advise re-running the plugin on a 504.
+  It is unnecessary — the thread nearly always returns — and costs the session.
+
+
 ### uSpec runs on the bridge — `uspec/`
 
 **uSpec** documents a Figma component: it reads a component set out of the file,

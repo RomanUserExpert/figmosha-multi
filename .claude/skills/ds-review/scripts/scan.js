@@ -39,7 +39,9 @@ for (const n of flat) {
     instanceCount++;
     let label = "?";
     try {
-      const main = await n.getMainComponentAsync();
+      // h.mainOf, not the raw call: it caches and counts, and warns through
+      // print() before the resolves add up to an out-of-memory crash.
+      const main = await h.mainOf(n);
       if (main) {
         label = (main.parent && main.parent.type === "COMPONENT_SET")
           ? main.parent.name + " / " + main.name

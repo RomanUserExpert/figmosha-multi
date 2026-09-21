@@ -52,7 +52,7 @@ for (const n of flat) {
   if (n.type === "INSTANCE") {
     const row = Object.assign({ w: Math.round(n.width), h: Math.round(n.height) }, at);
     try {
-      const main = await n.getMainComponentAsync();
+      const main = await h.mainOf(n);
       row.component = main
         ? ((main.parent && main.parent.type === "COMPONENT_SET") ? main.parent.name : main.name)
         : "?";

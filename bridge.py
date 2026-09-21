@@ -3,9 +3,16 @@
 
 HTTP API (clients like curl / figmosha CLI talk here):
     POST /exec     {code, timeout?, session?, want_value?} -> {ok, result, value, logs, elapsed_ms}
-    GET  /status                                  -> {plugin_connected, pending, project, sessions}
+    GET  /status                                  -> {plugin_connected, pending, busy, project, sessions}
     GET  /sessions[?session=X]                    -> one row per connected Figma file,
                                                      plus which of them X matches
+    POST /sessions/<sid>/reset                    -> forget what a wedged session runs
+
+A caller's timeout is not the plugin's. Giving up on a request does not stop
+the script: Figma runs plugins on one synchronous JS thread, and nothing can
+interrupt it. The bridge therefore keeps abandoned requests in
+`Session.running` and refuses to dispatch into a busy plugin, instead of
+stacking a second script onto a thread that is still working.
 
 WebSocket (the Figma plugin connects here once it's opened in Figma Desktop):
     WS   /plugin
@@ -62,6 +69,13 @@ class Session:
         self.page = page
         self.alias = ""
         self.pending: dict = {}      # rid -> {"future", "logs", "t0"}
+        # Requests the plugin was handed and has not answered yet — whether or
+        # not an HTTP caller is still waiting. `pending` empties the moment a
+        # caller gives up; the plugin's single JS thread does not. Keeping the
+        # two apart is what stops the bridge from dispatching a second script
+        # into a thread that is still chewing on the first one.
+        self.running: dict = {}      # rid -> {"t0", "started_at", "caller_left_at"}
+        self.idle_waiters: list = []  # futures resolved when `running` empties
         # One document is one JS runtime: two scripts interleaving at their
         # await points would see each other's half-finished edits. Per session,
         # never global — different documents are genuinely parallel.
@@ -78,8 +92,15 @@ class Session:
     def label(self) -> str:
         return self.alias or self.file or self.sid
 
+    def running_entry(self):
+        """The oldest unanswered request, or None. Usually there is at most one."""
+        if not self.running:
+            return None
+        rid = min(self.running, key=lambda r: self.running[r]["t0"])
+        return rid, self.running[rid]
+
     def describe(self) -> dict:
-        return {
+        d = {
             "sid": self.sid,
             "file": self.file,
             "page": self.page,
@@ -87,7 +108,20 @@ class Session:
             "pending": len(self.pending),
             "queued": self.queued,
             "age_s": int(time.time() - self.opened),
+            # `pending` and `queued` are not busy signals: the first drops to 0
+            # the moment a caller gives up, the second counts callers waiting
+            # for a lock that a 504 has already released. `busy` is the honest
+            # one — it says the plugin's thread has not come back.
+            "busy": bool(self.running),
         }
+        cur = self.running_entry()
+        if cur:
+            rid, e = cur
+            d["running_rid"] = rid
+            d["running_ms"] = int((time.time() - e["t0"]) * 1000)
+            d["started"] = e["started_at"] is not None
+            d["orphaned"] = e["caller_left_at"] is not None
+        return d
 
 
 def live_sessions() -> list:
@@ -172,6 +206,17 @@ ERROR_HINTS = [
      "check variant values: const v = await h.variantsOf(instance); return v.groups"),
     ("setProperties",
      "if 'Unable to find variant' — check available values via h.variantsOf(instance)"),
+    ("documentaccess",
+     "this plugin runs with documentAccess: dynamic-page, where the synchronous "
+     "lookups throw. Replace `.mainComponent` with `await h.mainOf(n)`, "
+     "`figma.getNodeById` with `await h.node(id)`, `component.instances` with "
+     "`await component.getInstancesAsync()`, and load another page before walking it: "
+     "`await h.loadPageOf(n)`. See CLAUDE.md -> Dynamic pages"),
+    ("loadallpagesasync",
+     "you are walking the whole document, which loads every page into the tab - the "
+     "thing that ends in an out-of-memory crash on a big file. Scan a subtree per "
+     "request instead: h.pages() lists pages without loading them, and "
+     "`await h.loadPageOf(n)` loads just one"),
     ("not a function",
      "API may be deprecated or renamed — check figma.* available methods, or use Async variants"),
 ]
@@ -223,6 +268,57 @@ def _fail_pending(session: Session, reason: str) -> None:
     for rid, entry in list(session.pending.items()):
         if not entry["future"].done():
             entry["future"].set_result({"id": rid, "type": "error", "text": reason})
+    # Whatever that plugin was still chewing on died with it - including work
+    # whose caller had already walked away. A fresh socket starts idle.
+    session.running.clear()
+    _wake_idle(session)
+
+
+def _wake_idle(session: Session) -> None:
+    """Tell everyone waiting on the plugin's thread that it is free."""
+    for fut in session.idle_waiters:
+        if not fut.done():
+            fut.set_result(True)
+    session.idle_waiters.clear()
+
+
+def _clear_running(session: Session, rid) -> float:
+    """Drop a request from `running`; wake anyone waiting for the plugin.
+
+    Returns how long an abandoned request had been running, or 0.0 for one
+    whose caller was still there (or for an id we were not tracking).
+    """
+    entry = session.running.pop(rid, None)
+    if entry is None:
+        return 0.0
+    ran = time.time() - entry["t0"] if entry["caller_left_at"] is not None else 0.0
+    if not session.running:
+        _wake_idle(session)
+    return ran
+
+
+async def _wait_idle(session: Session, timeout: float) -> bool:
+    """Wait until the plugin has answered everything it was handed.
+
+    Holding the lock says nothing here: a 504 releases it while the plugin's
+    thread is still running the script its caller gave up on. Sending a second
+    script into that thread is what turned one overrun into minutes of a dead
+    file, and twice into an out-of-memory crash.
+    """
+    if not session.running:
+        return True
+    if timeout <= 0:
+        return False
+    fut = asyncio.get_running_loop().create_future()
+    session.idle_waiters.append(fut)
+    try:
+        await asyncio.wait_for(fut, timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        if fut in session.idle_waiters:
+            session.idle_waiters.remove(fut)
 
 
 async def _incumbent_answers(session: Session, timeout: float = 1.0) -> bool:
@@ -338,9 +434,29 @@ def _handle_message(session: Session, m: dict) -> None:
         session.page = m.get("page", session.page)
         return
 
-    entry = session.pending.get(m.get("id"))
+    rid = m.get("id")
+
+    if mtype == "started":
+        # The plugin has picked the request up. Until this arrives it is
+        # dispatched but not running - which is the difference between "the
+        # thread is busy with someone else" and "this script is slow".
+        run = session.running.get(rid)
+        if run is not None and run["started_at"] is None:
+            run["started_at"] = time.time()
+        return
+
+    if mtype in ("result", "error"):
+        # Clear `running` first, and whether or not a caller is still waiting:
+        # a late answer to an abandoned request is exactly the event that frees
+        # the file, and it has no `pending` entry left to hang itself on.
+        late = _clear_running(session, rid)
+        if late:
+            print(f"[plugin] {session.sid}: {rid} answered {late:.0f}s after its "
+                  f"caller gave up - the file is free again")
+
+    entry = session.pending.get(rid)
     if not entry:
-        # late reply for a request that already timed out — drop it
+        # late reply for a request that already timed out - drop the payload
         return
 
     if mtype == "log":
@@ -537,6 +653,36 @@ async def exec_handler(request: web.Request) -> web.Response:
         session.queued -= 1
 
     try:
+        # The lock being free does not mean the plugin is. Anything left in
+        # `running` is a script whose caller gave up while the plugin's single
+        # JS thread kept going. Wait for it, then refuse - never stack.
+        current = None
+        if session.running and not await _wait_idle(
+                session, timeout - (time.monotonic() - queued_at)):
+            # It can have cleared between the wait giving up and this line; a
+            # plugin that answered in that window has earned the dispatch.
+            current = session.running_entry()
+        if current is not None:
+            busy_rid, run = current
+            busy_s = time.time() - run["t0"]
+            left = run["caller_left_at"]
+            return json_response(
+                {"ok": False,
+                 "error": f"timeout after {timeout:.0f}s: «{session.label()}» is busy - "
+                          f"{busy_rid} has been running for {busy_s:.0f}s"
+                          + (f", and its caller gave up {time.time() - left:.0f}s ago"
+                             if left else ""),
+                 "busy": True,
+                 "running_rid": busy_rid,
+                 "running_ms": int(busy_s * 1000),
+                 "waited_ms": int((time.monotonic() - queued_at) * 1000),
+                 "ran_ms": 0,
+                 "hint": "the plugin is one synchronous JS thread and cannot be "
+                         "interrupted; it usually comes back on its own. Watch "
+                         "`figmosha sessions` (busy, running_ms) and wait. Only if it "
+                         "never returns: `figmosha sessions --reset <sid>`"},
+                status=504)
+
         waited_ms = int((time.monotonic() - queued_at) * 1000)
         remaining = timeout - (time.monotonic() - queued_at)
 
@@ -550,21 +696,43 @@ async def exec_handler(request: web.Request) -> web.Response:
         want_value = body.get("want_value", True) is not False
         try:
             await session.ws.send_str(json.dumps(
-                {"id": rid, "type": "exec", "code": code, "want_value": want_value}))
+                {"id": rid, "type": "exec", "code": code, "want_value": want_value,
+                 # What the caller will actually wait for. The plugin cannot be
+                 # interrupted, so this is only advisory - but the walking
+                 # helpers check it and hand back a cursor instead of running on
+                 # into a file nobody is listening to any more.
+                 "deadline_ms": int(max(remaining, 0) * 1000)}))
         except Exception as e:
             session.pending.pop(rid, None)
             return json_response({"ok": False, "error": f"send to plugin failed: {e}"}, status=500)
+
+        # Dispatched. From here the plugin owns this request until it answers
+        # or its socket dies - our caller walking away changes nothing.
+        session.running[rid] = {"t0": time.time(), "started_at": None,
+                                "caller_left_at": None}
 
         try:
             result = await asyncio.wait_for(fut, timeout=remaining)
         except asyncio.TimeoutError:
             entry = session.pending.pop(rid, None)
-            ran_ms = int((time.time() - entry["t0"]) * 1000) if entry else 0
+            run = session.running.get(rid)
+            if run is not None:
+                # We stop waiting; the plugin does not stop running. Record when
+                # that happened, so the next caller can be told how long ago.
+                run["caller_left_at"] = time.time()
+            dispatched_ms = int((time.time() - entry["t0"]) * 1000) if entry else 0
+            ran_ms = (int((time.time() - run["started_at"]) * 1000)
+                      if run is not None and run["started_at"] else dispatched_ms)
             return json_response(
                 {"ok": False,
                  "error": f"timeout after {timeout:.0f}s",
                  "waited_ms": waited_ms,
-                 "ran_ms": ran_ms},
+                 "ran_ms": ran_ms,
+                 "dispatched_ms": dispatched_ms,
+                 "started": bool(run is not None and run["started_at"]),
+                 "hint": "the CLI gave up; the plugin did not. That script still owns "
+                         "this file's JS thread, so the next request will be refused "
+                         "with `busy` until it returns. Watch `figmosha sessions`."},
                 status=504)
 
         entry = session.pending.pop(rid)
@@ -618,6 +786,42 @@ async def sessions_handler(request: web.Request) -> web.Response:
     return json_response(out)
 
 
+async def session_reset_handler(request: web.Request) -> web.Response:
+    """Forget what a session is still running. By hand, never automatically.
+
+    Nothing here interrupts a script - Figma offers no way to - so this only
+    stops the bridge refusing new work. Use it on a plugin that is wedged for
+    good. Use it early and the next script lands in a thread that is still
+    busy, which is the failure the whole mechanism exists to prevent.
+    """
+    blocked = _guard(request)
+    if blocked is not None:
+        return blocked
+
+    sid = request.match_info["sid"]
+    session = SESSIONS.get(sid)
+    if session is None or not session.live:
+        return json_response(
+            {"ok": False, "error": f"no connected session {sid!r}",
+             "sessions": [s.describe() for s in live_sessions()]},
+            status=404)
+
+    cleared = [{"rid": rid, "running_ms": int((time.time() - e["t0"]) * 1000)}
+               for rid, e in session.running.items()]
+    session.running.clear()
+    _wake_idle(session)
+    if cleared:
+        print(f"[plugin] {sid}: running state reset by hand ({len(cleared)} request(s))")
+    return json_response({
+        "ok": True,
+        "sid": sid,
+        "cleared": cleared,
+        "warning": "the bridge has forgotten these requests; if the plugin is still "
+                   "running one of them, the next script shares its thread. Re-run the "
+                   "plugin in Figma if the file stays unresponsive.",
+    })
+
+
 async def status_handler(request: web.Request) -> web.Response:
     blocked = _guard(request)
     if blocked is not None:
@@ -631,6 +835,9 @@ async def status_handler(request: web.Request) -> web.Response:
         "pending": pending_total(),
         "project": PROJECT_NAME,
         "sessions": len(live),
+        # Neither `plugin_connected` nor `pending` can say "the thread is
+        # occupied"; this can, and it is what a runner should look at.
+        "busy": sum(1 for s in live if s.running),
     })
 
 
@@ -648,7 +855,8 @@ async def root_handler(request: web.Request) -> web.Response:
                           "{ok, result, value, logs, elapsed_ms}",
             "GET /status": "{plugin_connected, pending, project, sessions}",
             "GET /sessions": "?session=X -> [{sid, file, page, alias, pending, queued, "
-                             "age_s}] + matched",
+                             "age_s, busy, running_ms}] + matched",
+            "POST /sessions/{sid}/reset": "forget what a wedged session is running",
             "WS /plugin": "Figma plugin connects here",
         },
     })
@@ -659,6 +867,7 @@ def build_app() -> web.Application:
     app.router.add_get("/", root_handler)
     app.router.add_get("/status", status_handler)
     app.router.add_get("/sessions", sessions_handler)
+    app.router.add_post("/sessions/{sid}/reset", session_reset_handler)
     app.router.add_post("/exec", exec_handler)
     app.router.add_get("/plugin", plugin_ws_handler)
     return app

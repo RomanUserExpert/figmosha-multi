@@ -314,7 +314,9 @@ python figmosha.py variant 1:30 "Property 1=Default"
 python figmosha.py clone 1:23 --right --gap 100  # clone adjacent
 python figmosha.py rm 1:99 1:100 1:101           # delete one or more nodes
 python figmosha.py rm sel                        # delete everything selected
-python figmosha.py find 1:23 type=TEXT --raw     # same query, full JSON instead of rows
+python figmosha.py find 1:23 type=TEXT --raw     # same query, the whole walk as JSON
+python figmosha.py find 1:23 type=INSTANCE --nested   # look inside instances too (off by default)
+python figmosha.py each 1:23 -f scan.js --split 2 --state run.jsonl --resume
 python figmosha.py icomp <component-key>         # import library component, place + zoom
 python figmosha.py status                        # bridge + plugin connection state
 python figmosha.py update                        # pull + re-stamp this copy's plugin identity
@@ -384,11 +386,13 @@ Currently hints cover: fills/strokes variable binding, frozen arrays, missing ma
 ## Limits / gotchas
 
 - Plugin is bound to the **currently open Figma file**. Switching files closes the plugin — re-Run it in the new file, where it becomes another session.
-- **One session per document, not per page.** `figma.currentPage` is document-wide, so two agents cannot split one file by page — they would switch pages under each other. Address nodes by id (`getNodeByIdAsync` after `loadAllPagesAsync`) instead.
+- **One session per document, not per page.** `figma.currentPage` is document-wide, so two agents cannot split one file by page — they would switch pages under each other. Address nodes by id (`await h.node(id)`, which loads that node's page) instead.
+- **A caller's timeout is not the plugin's.** Figma runs plugins on one synchronous JS thread that nothing can interrupt, so giving up on a request does not stop the script. The bridge remembers abandoned requests and refuses the next one with `busy` rather than stacking it onto a thread that is still working — watch `busy` / `running_ms` in `figmosha sessions`, and wait.
+- **Big files need a subtree per request.** Never walk a whole file or a whole page in one call; `figmosha each --split` descends first and writes state per unit. See `CLAUDE.md → Big files`.
 - **Scripts in one file are serialised.** A long one makes the next wait rather than interleave mid-`await`. Different files run in parallel.
 - The **same document open twice** (two Figma windows) is still one session: the second plugin is turned away. If the first has gone silent (laptop slept) the newcomer takes over within about a second, so a genuine reconnect is never locked out.
 - Ports are per project. A copy without `project.json` will not start a bridge — run `figmosha init` first.
-- **Figma sync errors** ("Unable to establish connection to Figma after 10 seconds") sometimes appear when fetching nodes from non-current pages. If you need cross-page access: `await figma.loadAllPagesAsync()` first.
+- **Figma sync errors** ("Unable to establish connection to Figma after 10 seconds") sometimes appear when fetching nodes from non-current pages. `await h.node(id)` loads that node's page for you; `await figma.loadAllPagesAsync()` loads every page, and on a large file that is the out-of-memory crash, so treat it as a last resort.
 - Bridge binds to `127.0.0.1` by default. For LAN access: `python bridge.py --host 0.0.0.0` (not recommended — anyone on your LAN can then run arbitrary code in your Figma).
 - Manifest changes (new permissions, etc.) require **re-importing** the plugin in Figma. `code.js` and `ui.html` changes are picked up on next Run.
 
@@ -402,7 +406,9 @@ chain and tells you which link is broken.
 | `connection refused` from CLI | Server not running | `bash start-bridge.sh`, or `.\start-bridge.ps1` on Windows |
 | `plugin not connected` (503) | Plugin window closed | Plugins → Development → Figmosha Bridge → Run |
 | Plugin says `disconnected, retrying…` | Server is down or restarting | Start it; plugin auto-reconnects within 2 s |
-| 504 timeout | Code threw silently or `await` never resolved | Close the plugin (X), Run again. Increase `--timeout` for legitimately long ops |
+| 504 timeout | The script is still running — your timeout is not the plugin's | **Do not re-Run and do not retry.** Check `figmosha sessions`: a `BUSY` row means the thread is still working and usually returns on its own. Scan a smaller subtree (`each --split`) rather than raising `--timeout` |
+| 504 `is busy` | An earlier script whose caller gave up still owns this file's thread | Wait. Only this file is blocked. Last resort: `figmosha sessions --reset <sid>` — it makes the bridge forget, it does not stop the script |
+| `did not settle in Ns` from `icomp` | The key is unpublished or belongs to another file, and the call would never return | Resolve from the consuming side: compare `(await h.mainOf(inst)).key` against the keys you want |
 | `permission not specified in manifest` | API needs a permission not declared in `manifest.json` | Add to `permissions` array, sync to Windows path if applicable, **re-import** plugin |
 | `Cannot write to node with unloaded font` | Need to load fonts first | Use `await h.setText(...)` or wrap edits in `h.withFonts(root, fn)` |
 | `Cannot assign to read only property` | `node.fills` is frozen | Use `await h.bF(node, idx, varId)` or copy: `JSON.parse(JSON.stringify(node.fills))` |

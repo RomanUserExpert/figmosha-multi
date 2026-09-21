@@ -113,19 +113,30 @@ const nodes = [
 ];
 const removed = [];
 const figma = {
+  showUI() {}, on() {},
+  ui: { onmessage: null, postMessage() {} },
+  root: { name: 'Stub', children: [] },
   currentPage: {
     selection: nodes,
+    children: nodes,
     findAll: (f) => nodes.filter(f),
+    findOne: (f) => nodes.find(f) || null,
     id: 'page', name: 'Page 1', type: 'PAGE',
   },
   getNodeByIdAsync: async (id) => nodes.find(n => n.id === id) || null,
 };
-const h = {
-  resolve: async (x) => x === 'page' ? figma.currentPage
-    : x === 'sel' ? figma.currentPage.selection[0]
-    : await figma.getNodeByIdAsync(x),
-};
+// The real helpers, not a stand-in: the generated JS leans on h.walk's pruning
+// and on h.resolve loading a page, and a hand-written stub of those would
+// drift from the plugin exactly where it matters.
+const h = new Function("figma", "__html__",
+  require("fs").readFileSync(PLUGIN_SRC_PATH, "utf8") + "\\nreturn HELPERS;")(figma, "");
 """
+
+# Prepended rather than interpolated further down, because two tests build
+# their own program out of STUB and neither should have to know about this.
+STUB = ("const PLUGIN_SRC_PATH = "
+        + json.dumps(str(Path(__file__).resolve().parent.parent / "plugin" / "code.js"))
+        + ";\n" + STUB)
 
 
 def run_js(code):
@@ -184,7 +195,12 @@ def test_raw_find_returns_structure(monkeypatch):
     seen = captured(monkeypatch)
     figmosha.cmd_find(parse("find", "page", "type=TEXT", "--raw"))
     assert seen["want_value"] is True
-    assert json.loads(run_js(seen["code"]))[0]["id"] == "1:3"
+    # --raw carries the walk itself, not just its hits: on a big subtree
+    # `partial` and `cursor` are the difference between a short answer and a
+    # wrong one.
+    out = json.loads(run_js(seen["code"]))
+    assert out["found"][0]["id"] == "1:3"
+    assert out["partial"] is False and out["visited"] == 2
 
 
 @needs_node
@@ -1116,3 +1132,196 @@ def test_the_default_host_is_an_address_not_a_name():
     import project
     import inspect
     assert inspect.signature(project.occupant).parameters["host"].default == "127.0.0.1"
+
+
+# ─── each: the runner that survives a long scan ───────────────────────────
+
+
+def _each_args(tmp_path, script="return 1;", **over):
+    f = tmp_path / "unit.js"
+    f.write_text(script, encoding="utf-8")
+    argv = ["each", "page", "-f", str(f)]
+    for k, v in over.items():
+        argv += ["--" + k.replace("_", "-")] + ([] if v is True else [str(v)])
+    return parse(*argv)
+
+
+def _fake_bridge(monkeypatch, handler):
+    """Stand in for the bridge: `handler(code)` returns (status, body)."""
+    seen = []
+
+    def fake_exec(code, timeout=60, want_value=False):
+        seen.append(code)
+        return handler(code)
+
+    monkeypatch.setattr(figmosha, "_exec", fake_exec)
+    return seen
+
+
+CHILDREN = "(n.children || []).map"
+
+
+def test_each_splits_before_it_runs_anything(monkeypatch, tmp_path, capsys):
+    """The whole point of --split: the unit size is chosen while it is free."""
+    listed = []
+
+    def handler(code):
+        if CHILDREN in code:
+            listed.append(code)
+            # One level: the page has two frames, and they have no children.
+            if len(listed) == 1:
+                return 200, {"ok": True, "value": [
+                    {"id": "1:1", "name": "Screen A", "type": "FRAME"},
+                    {"id": "1:2", "name": "Screen B", "type": "FRAME"}]}
+            return 200, {"ok": True, "value": []}
+        return 200, {"ok": True, "value": "done"}
+
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path))
+    assert rc == 0
+    ran = [c for c in seen if CHILDREN not in c]
+    assert len(ran) == 2, "one run per leaf"
+    assert 'const ROOT_ID = "1:1";' in ran[0]
+    assert 'const ROOT_ID = "1:2";' in ran[1]
+
+
+def test_each_splits_a_unit_that_times_out_instead_of_retrying(monkeypatch, tmp_path):
+    """An overrun costs minutes of a blocked file; running it again costs them twice."""
+    def handler(code):
+        if CHILDREN in code:
+            if '"page"' in code:
+                return 200, {"ok": True, "value": [
+                    {"id": "1:1", "name": "Big", "type": "FRAME"}]}
+            return 200, {"ok": True, "value": [
+                {"id": "2:1", "name": "Section", "type": "FRAME"}]}
+        if 'const ROOT_ID = "1:1";' in code:
+            return 504, {"ok": False, "error": "timeout after 60s", "busy": True}
+        return 200, {"ok": True, "value": "done"}
+
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path))
+    ran = [c for c in seen if CHILDREN not in c]
+    assert len([c for c in ran if 'const ROOT_ID = "1:1";' in c]) == 1, "never retried"
+    assert any('const ROOT_ID = "2:1";' in c for c in ran), "its children ran instead"
+    assert rc == 0
+
+
+def test_each_writes_state_after_every_unit(monkeypatch, tmp_path):
+    """Written as it goes, because the next unit may be the crash."""
+    def handler(code):
+        if CHILDREN in code:
+            return 200, {"ok": True, "value": [
+                {"id": "1:1", "name": "A", "type": "FRAME"},
+                {"id": "1:2", "name": "B", "type": "FRAME"}]}
+        if 'const ROOT_ID = "1:2";' in code:
+            return 500, {"ok": False, "error": "n is not defined"}
+        return 200, {"ok": True, "value": 7}
+
+    _fake_bridge(monkeypatch, handler)
+    state = tmp_path / "run.jsonl"
+    rc = figmosha.cmd_each(_each_args(tmp_path, state=str(state)))
+    assert rc == figmosha.EXIT_SCRIPT
+    rows = [json.loads(l) for l in state.read_text(encoding="utf-8").splitlines()]
+    assert [r["status"] for r in rows] == ["ok", "failed"]
+    assert rows[0]["value"] == 7
+
+
+def test_each_resume_skips_what_is_already_done(monkeypatch, tmp_path):
+    def handler(code):
+        if CHILDREN in code:
+            return 200, {"ok": True, "value": [
+                {"id": "1:1", "name": "A", "type": "FRAME"},
+                {"id": "1:2", "name": "B", "type": "FRAME"}]}
+        return 200, {"ok": True, "value": "done"}
+
+    state = tmp_path / "run.jsonl"
+    state.write_text(json.dumps({"id": "1:1", "status": "ok"}) + "\n", encoding="utf-8")
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path, state=str(state), resume=True))
+    assert rc == 0
+    ran = [c for c in seen if CHILDREN not in c]
+    assert len(ran) == 1 and 'const ROOT_ID = "1:2";' in ran[0]
+
+
+def test_each_stops_when_the_plugin_is_gone(monkeypatch, tmp_path):
+    """Going on would fail every remaining unit, slowly, and lose the state."""
+    monkeypatch.setattr(figmosha, "_wait_for_plugin", lambda s: False)
+
+    def handler(code):
+        if CHILDREN in code:
+            return 200, {"ok": True, "value": [
+                {"id": "1:1", "name": "A", "type": "FRAME"},
+                {"id": "1:2", "name": "B", "type": "FRAME"}]}
+        return 503, {"ok": False, "error": "plugin not connected - open Figmosha in Figma"}
+
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path))
+    assert rc == figmosha.EXIT_NO_PLUGIN
+    assert len([c for c in seen if CHILDREN not in c]) == 1, "stopped at the first one"
+
+
+# ─── exit codes: what a runner branches on ────────────────────────────────
+
+def test_exit_codes_tell_the_three_failures_apart():
+    assert figmosha._exit_code(200, {"ok": True}) == 0
+    assert figmosha._exit_code(500, {"ok": False, "error": "x is not defined"}) == 1
+    assert figmosha._exit_code(503, {"ok": False, "error": "plugin not connected"}) == 3
+    assert figmosha._exit_code(
+        500, {"ok": False, "error": "plugin disconnected mid-request"}) == 3
+    assert figmosha._exit_code(504, {"ok": False, "error": "timeout after 60s"}) == 4
+
+
+# ─── --set: three spellings, because guessing is wrong expensively ────────
+
+def test_set_str_keeps_json_text_as_a_string():
+    """The measured trap: --set KEYS={"a":"b"} arrives as an object, and the
+    script's JSON.parse(KEYS) throws on the first line."""
+    assert figmosha.prelude([("auto", 'KEYS={"a":"b"}')]) == \
+        'const KEYS = {"a": "b"};\n'
+    assert figmosha.prelude([("str", 'KEYS={"a":"b"}')]) == \
+        'const KEYS = "{\\"a\\":\\"b\\"}";\n'
+
+
+def test_set_json_refuses_what_is_not_json():
+    with pytest.raises(ValueError, match="not valid JSON"):
+        figmosha.prelude([("json", "IDS=185:21880")])
+
+
+def test_set_reads_a_value_from_a_file(tmp_path):
+    f = tmp_path / "keys.json"
+    f.write_text('["a", "b"]', encoding="utf-8")
+    assert figmosha.prelude([("auto", f"KEYS=@{f}")]) == 'const KEYS = ["a", "b"];\n'
+
+
+def test_set_says_which_file_it_could_not_read(tmp_path):
+    with pytest.raises(ValueError, match="KEYS=@"):
+        figmosha.prelude([("auto", f"KEYS=@{tmp_path / 'missing.json'}")])
+
+
+def test_each_waits_out_the_busy_thread_before_calling_a_unit_unsplittable(
+        monkeypatch, tmp_path):
+    """The unit that just overran still owns the thread, so the listing that
+    decides whether it can be split must be asked with room to wait."""
+    budgets = []
+
+    def handler(code):
+        if CHILDREN in code:
+            if '"page"' in code:
+                return 200, {"ok": True, "value": [
+                    {"id": "1:1", "name": "Big", "type": "FRAME"}]}
+            return 200, {"ok": True, "value": [
+                {"id": "2:1", "name": "Section", "type": "FRAME"}]}
+        if 'const ROOT_ID = "1:1";' in code:
+            return 504, {"ok": False, "error": "timeout after 2s", "busy": True}
+        return 200, {"ok": True, "value": "done"}
+
+    def fake_exec(code, timeout=60, want_value=False):
+        budgets.append((code, timeout))
+        return handler(code)
+
+    monkeypatch.setattr(figmosha, "_exec", fake_exec)
+    rc = figmosha.cmd_each(_each_args(tmp_path, timeout=2))
+    assert rc == 0
+    split_listing = [t for c, t in budgets if CHILDREN in c and '"page"' not in c]
+    assert split_listing and min(split_listing) >= 120, \
+        "the split listing must outlast the script that is still running"

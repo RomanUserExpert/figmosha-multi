@@ -701,3 +701,211 @@ def test_a_silent_plugin_still_times_out():
             assert session.pong_waiters == []
         await c.close()
     run(go())
+
+
+# ─── an abandoned request still owns the plugin ───────────────────────────
+
+
+class HeldPlugin:
+    """A plugin that takes requests and answers only when told to.
+
+    The real failure needs exactly this shape: the CLI gives up, the script
+    keeps running inside Figma, and the answer - if it ever comes - arrives
+    long after nobody is waiting for it.
+    """
+
+    def __init__(self, client, *, sid=None, file="", send_started=False):
+        self.client = client
+        self.sid = sid
+        self.file = file
+        self.send_started = send_started
+        self.ws = None
+        self._task = None
+        self.held = []               # exec messages received and not answered
+
+    async def __aenter__(self):
+        self.ws = await self.client.ws_connect("/plugin", headers={"Origin": "null"})
+        hello = {"type": "hello", "version": "test"}
+        if self.sid:
+            hello["sid"] = self.sid
+            hello["file"] = self.file or self.sid
+        await self.ws.send_str(json.dumps(hello))
+        self._task = asyncio.create_task(self._pump())
+        await asyncio.sleep(0.1)
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._task:
+            self._task.cancel()
+        if self.ws and not self.ws.closed:
+            await self.ws.close()
+
+    async def _pump(self):
+        async for msg in self.ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            m = json.loads(msg.data)
+            if m.get("type") == "ping":
+                await self.ws.send_str(json.dumps({"type": "pong"}))
+            elif m.get("type") == "exec":
+                self.held.append(m)
+                if self.send_started:
+                    await self.ws.send_str(json.dumps(
+                        {"type": "started", "id": m["id"]}))
+
+    async def answer(self, index=0, **out):
+        m = self.held[index]
+        await self.ws.send_str(json.dumps(
+            {"type": out.pop("type", "result"), "id": m["id"],
+             "text": out.pop("text", "late"), **out}))
+        await asyncio.sleep(0.1)
+
+
+def test_a_timed_out_request_stays_in_running():
+    """504 empties `pending`; the plugin is still busy, so `running` must hold."""
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One") as p:
+            r = await c.post("/exec", json={"code": "slow", "timeout": 1})
+            assert r.status == 504
+            session = bridge.SESSIONS["s1"]
+            assert session.pending == {}, "pending must be cleared for the caller"
+            assert len(session.running) == 1, "the plugin is still running it"
+            assert session.describe()["busy"] is True
+            assert session.describe()["orphaned"] is True
+            assert session.describe()["running_ms"] >= 1000
+            assert len(p.held) == 1
+        await c.close()
+    run(go())
+
+
+def test_the_next_request_is_refused_not_stacked():
+    """The bug: after a 504 the bridge sent the next script into a busy thread."""
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One") as p:
+            assert (await c.post("/exec", json={"code": "slow", "timeout": 1})).status == 504
+
+            r = await c.post("/exec", json={"code": "return 1", "timeout": 1})
+            body = await r.json()
+            assert r.status == 504
+            assert body["busy"] is True
+            assert "is busy" in body["error"]
+            assert body["running_ms"] >= 1000
+            assert "sessions --reset" in body["hint"]
+            # The point of the whole mechanism: it was never dispatched.
+            assert len(p.held) == 1, "a second script was sent into a busy plugin"
+        await c.close()
+    run(go())
+
+
+def test_a_late_answer_frees_the_file():
+    """The thread comes back on its own; the next request must go through."""
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One") as p:
+            assert (await c.post("/exec", json={"code": "slow", "timeout": 1})).status == 504
+            session = bridge.SESSIONS["s1"]
+            assert session.running
+
+            await p.answer(0, value=1)
+            assert session.running == {}, "a late reply must clear running"
+            assert session.describe()["busy"] is False
+
+            # And the file works again, with no reset and no re-Run.
+            task = asyncio.create_task(
+                c.post("/exec", json={"code": "return 2", "timeout": 5}))
+            await asyncio.sleep(0.15)
+            await p.answer(1, value=2)
+            r = await asyncio.wait_for(task, timeout=5)
+            assert r.status == 200 and (await r.json())["value"] == 2
+        await c.close()
+    run(go())
+
+
+def test_a_caller_waits_out_a_busy_plugin_within_its_own_timeout():
+    """Refusing is the last resort: a caller with time to spare should wait."""
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One") as p:
+            assert (await c.post("/exec", json={"code": "slow", "timeout": 1})).status == 504
+
+            task = asyncio.create_task(
+                c.post("/exec", json={"code": "return 1", "timeout": 10}))
+            await asyncio.sleep(0.2)
+            assert len(p.held) == 1, "must not dispatch while the thread is busy"
+
+            await p.answer(0, value=1)          # the orphan finally returns
+            await asyncio.sleep(0.15)
+            assert len(p.held) == 2, "the waiting caller should now be dispatched"
+            await p.answer(1, value=7)
+            r = await asyncio.wait_for(task, timeout=5)
+            assert r.status == 200 and (await r.json())["value"] == 7
+        await c.close()
+    run(go())
+
+
+def test_started_makes_ran_ms_honest():
+    """Dispatched is not running: without `started` the two are indistinguishable."""
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One", send_started=True):
+            r = await c.post("/exec", json={"code": "slow", "timeout": 1})
+            body = await r.json()
+            assert r.status == 504 and body["started"] is True
+            assert bridge.SESSIONS["s1"].describe()["started"] is True
+        await c.close()
+    run(go())
+
+
+def test_a_disconnect_clears_running():
+    """An OOM takes the tab with it; the session must not come back busy."""
+    async def go():
+        c = await make_client()
+        p = HeldPlugin(c, sid="s1", file="One")
+        await p.__aenter__()
+        assert (await c.post("/exec", json={"code": "slow", "timeout": 1})).status == 504
+        session = bridge.SESSIONS["s1"]
+        assert session.running
+        await p.__aexit__()
+        await asyncio.sleep(0.2)
+        assert session.running == {}
+        await c.close()
+    run(go())
+
+
+def test_reset_clears_running_by_hand():
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One") as p:
+            assert (await c.post("/exec", json={"code": "slow", "timeout": 1})).status == 504
+
+            r = await c.post("/sessions/s1/reset")
+            body = await r.json()
+            assert r.status == 200 and body["ok"] is True
+            assert len(body["cleared"]) == 1
+            assert "still running" in body["warning"]
+            assert bridge.SESSIONS["s1"].running == {}
+
+            task = asyncio.create_task(
+                c.post("/exec", json={"code": "return 1", "timeout": 5}))
+            await asyncio.sleep(0.15)
+            assert len(p.held) == 2, "reset should let the next script through"
+            await p.answer(1, value=1)
+            assert (await asyncio.wait_for(task, timeout=5)).status == 200
+
+            assert (await c.post("/sessions/nope/reset")).status == 404
+        await c.close()
+    run(go())
+
+
+def test_status_reports_busy_sessions():
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One"):
+            assert (await c.get("/status")).status == 200
+            assert (await (await c.get("/status")).json())["busy"] == 0
+            assert (await c.post("/exec", json={"code": "slow", "timeout": 1})).status == 504
+            assert (await (await c.get("/status")).json())["busy"] == 1
+        await c.close()
+    run(go())

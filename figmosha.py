@@ -5,6 +5,7 @@ Commands:
     figmosha exec "<js>"             # run arbitrary JS in plugin context
     figmosha exec --file f.js
     figmosha exec --stdin
+    figmosha each <id> -f s.js --split 2 --state run.jsonl [--resume]
     figmosha status                   # check server / plugin connection
     figmosha sessions                 # which Figma files are connected
     figmosha doctor                   # diagnose the whole chain, with fixes
@@ -14,6 +15,7 @@ Commands:
     figmosha styles [filter]          # local paint / text / effect / grid styles
     figmosha tree <id> [--depth N] [--layout]
     figmosha find <id> <filter>       # find descendants (name=X, name~X, type=X, text=X)
+                                      #   instances are not descended into; --nested does
     figmosha text <id> "<new text>"   # set TEXT node characters (autoloads font)
     figmosha variant <id> "P=V" ...   # set INSTANCE variant property values
     figmosha clone <id> [--right|--left|--up|--down] [--gap N] [--name N]
@@ -43,6 +45,13 @@ Helpers available inside exec'd code (as `h.*`):
     h.frame(parent, {layout, w, h, spacing, padding, align, fill, radius, name})
     h.node(id)                  h.var_(idOrKey)
     h.importComp(key)           h.importVar(key)
+    h.walk(root, visit, {pruneInstances, budgetMs, maxNodes, maxDepth, cursor})
+    h.mainOf(instance)          h.loadPageOf(node)         h.pages()
+    h.tick()                    h.left()                   h.stats()
+
+On a big file, h.walk is the one to reach for: it skips the inside of
+instances, stops when the caller's timeout runs out, and hands back a cursor to
+carry on with — none of which a bare findAll can do.
 """
 
 import argparse
@@ -50,6 +59,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date
 import urllib.error
 import urllib.parse
@@ -75,20 +85,26 @@ DEFAULT_PORT = int(os.environ.get("FIGMOSHA_PORT")
 # would otherwise overwrite each other's choice and silently edit the wrong file.
 DEFAULT_SESSION = os.environ.get("FIGMOSHA_SESSION", "")
 
+# Seconds to wait for the plugin to reappear before giving up. 0 keeps the old
+# behaviour — fail at once. Anything above that is for long runs, which lose
+# the plugin at least once: switching files in Figma closes its window.
+DEFAULT_WAIT_PLUGIN = int(os.environ.get("FIGMOSHA_WAIT_PLUGIN") or 0)
+
 HOST = DEFAULT_HOST
 PORT = DEFAULT_PORT
 SESSION = DEFAULT_SESSION
+WAIT_PLUGIN = DEFAULT_WAIT_PLUGIN
 
 KNOWN_CMDS = {
     "exec", "status", "doctor", "sel", "tree", "find", "text", "variant",
     "clone", "rm", "import-component", "icomp", "init", "sessions", "props",
-    "vars", "styles", "update", "set", "bind", "overrides", "where",
+    "vars", "styles", "update", "set", "bind", "overrides", "where", "each",
 }
 
 # Options that belong to the parser itself rather than to a subcommand, and
 # take a value. They are the reason `figmosha "<js>"` cannot simply look at
 # argv[1]: in a project with two open files every command carries --session.
-GLOBAL_VALUE_FLAGS = {"--host", "--port", "--session"}
+GLOBAL_VALUE_FLAGS = {"--host", "--port", "--session", "--wait-plugin"}
 
 # How many stack frames of a plugin-side error are worth printing. The first
 # one names the line that threw; everything after ~3 is the plugin runtime.
@@ -156,6 +172,27 @@ def force_utf8_output():
             pass
 
 
+# Exit codes, because a runner has to tell these apart without parsing prose.
+# 1 is "your script is wrong" — stop and show it. 3 and 4 are "the file is not
+# available right now" — wait and come back. Conflating them is what made every
+# long run treat a closed plugin window as a broken script.
+EXIT_SCRIPT = 1       # the code threw, or the bridge refused the request
+EXIT_USAGE = 2        # wrong arguments, or no bridge at all
+EXIT_NO_PLUGIN = 3    # no plugin connected, or it vanished mid-request
+EXIT_BUSY = 4         # timed out, or the file is busy with an earlier script
+
+
+def _exit_code(status, resp):
+    """Classify a bridge response into one of the codes above."""
+    if resp.get("ok") is not False:
+        return 0
+    if status == 504:
+        return EXIT_BUSY
+    if status == 503 or "disconnected mid-request" in str(resp.get("error", "")):
+        return EXIT_NO_PLUGIN
+    return EXIT_SCRIPT
+
+
 def node_expr(id_or_alias):
     """JS that resolves a node id, or the aliases `page` / `sel`."""
     return f"await h.resolve({json.dumps(id_or_alias)})"
@@ -198,15 +235,62 @@ def _exec(code, timeout=60, want_value=False):
     payload = {"code": code, "timeout": timeout, "want_value": want_value}
     if SESSION:
         payload["session"] = SESSION
-    return _request("POST", "/exec", payload, timeout=timeout + 5)
+    status, resp = _request("POST", "/exec", payload, timeout=timeout + 5)
+
+    # Switching files in Figma closes the plugin window, and every long run
+    # meets that at least once. With --wait-plugin the run pauses instead of
+    # dying on a step it would have completed a few seconds later.
+    if WAIT_PLUGIN and _exit_code(status, resp) == EXIT_NO_PLUGIN:
+        if _wait_for_plugin(WAIT_PLUGIN):
+            status, resp = _request("POST", "/exec", payload, timeout=timeout + 5)
+    return status, resp
 
 
-def _emit(resp, raw=False):
+def _plugin_is_back():
+    """Is there exactly one connected file that this invocation would target?"""
+    path = "/sessions" + (f"?session={urllib.parse.quote(SESSION)}" if SESSION else "")
+    status, resp = _request("GET", path)
+    if status != 200:
+        return False
+    rows = resp.get("sessions") or []
+    if not rows:
+        return False
+    if SESSION:
+        return len(resp.get("matched") or []) == 1
+    return True
+
+
+def _wait_for_plugin(seconds):
+    """Poll until the plugin is back, up to `seconds`. True if it returned.
+
+    Polled rather than pushed because the plugin reconnects on its own schedule
+    — re-Run in Figma is a human action, and the bridge has nothing to notify.
+    """
+    print(f"figmosha: plugin not connected — waiting up to {seconds}s "
+          f"(run it in Figma: Plugins → Development)", file=sys.stderr)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if _plugin_is_back():
+            print("figmosha: plugin is back — continuing", file=sys.stderr)
+            return True
+        time.sleep(1.0)
+    print(f"figmosha: gave up waiting after {seconds}s", file=sys.stderr)
+    return False
+
+
+def _send(code, args, timeout=None):
+    """Run code in Figma and print the answer. Every command ends here."""
+    status, resp = _exec(code, timeout or args.timeout, want_value=args.raw)
+    return _emit(resp, raw=args.raw, status=status)
+
+
+def _emit(resp, raw=False, status=None):
     if raw:
         # ensure_ascii=False because layer names are routinely Cyrillic, and an
         # escaped \uXXXX is six characters — and six times the tokens — each.
         print(json.dumps(resp, indent=2, ensure_ascii=False))
-        return 0 if resp.get("ok") else 1
+        return _exit_code(status, resp) if status is not None else (
+            0 if resp.get("ok") else EXIT_SCRIPT)
 
     for line in resp.get("logs") or []:
         print(f"  log: {line}", file=sys.stderr)
@@ -229,7 +313,7 @@ def _emit(resp, raw=False):
             if len(frames) > STACK_FRAMES:
                 print(f"   … {len(frames) - STACK_FRAMES} more frames (--raw for all)",
                       file=sys.stderr)
-        return 1
+        return _exit_code(status, resp) if status is not None else EXIT_SCRIPT
 
     if resp.get("result"):
         print(resp["result"])
@@ -252,7 +336,11 @@ def cmd_status(args):
               else "plugin connected" if resp.get("plugin_connected")
               else "plugin not connected")
     who = f"«{resp['project']}»" if resp.get("project") else "unclaimed bridge"
-    print(f"{who} {HOST}:{PORT} · {plugin} · {resp.get('pending', 0)} pending")
+    # `pending` says how many callers are waiting, which is not the same as how
+    # many files are stuck; `busy` is the one a runner should branch on.
+    busy = resp.get("busy", 0)
+    print(f"{who} {HOST}:{PORT} · {plugin} · {resp.get('pending', 0)} pending"
+          + (f" · {busy} busy" if busy else ""))
     return 0
 
 
@@ -886,7 +974,7 @@ def cmd_props(args):
             .replace("__ID__", json.dumps(args.node_id))
             .replace("__ALL__", "true" if args.all else "false")
             .replace("__KIDS__", "true" if args.children else "false"))
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 # What tokens exist at all — the other half of `props`, which can only say
@@ -1084,12 +1172,12 @@ def cmd_vars(args):
             .replace("__FILTER__", json.dumps(args.filter or ""))
             .replace("__TYPE__", json.dumps(args.type.upper()) if args.type else "null")
             .replace("__MAX__", str(MAX_ROWS)))
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_styles(args):
     code = STYLES_JS.replace("__FILTER__", json.dumps(args.filter or ""))
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_sel(args):
@@ -1101,7 +1189,7 @@ def cmd_sel(args):
             f"const s = figma.currentPage.selection;"
             f"return s.length ? s.map(row).join('\\n') : 'nothing selected';"
         )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_doctor(args):
@@ -1142,6 +1230,7 @@ def cmd_doctor(args):
         return 1
     listing_status, listing = _request("GET", "/sessions")
     rows = listing.get("sessions") or []
+    busy_rows = [r for r in rows if r.get("busy")]
     if listing_status == 404:
         ok("plugin connected (bridge predates sessions — restart it to list files)")
     elif rows:
@@ -1153,6 +1242,18 @@ def cmd_doctor(args):
         # Connected, but the plugin never said which file it is in.
         ok("plugin connected (pre-2.2 plugin: does not report its file)")
 
+    if busy_rows:
+        # Worth stopping for, and worth not prescribing a re-Run: the thread
+        # nearly always comes back, and a re-Run costs the session with it.
+        for row in busy_rows:
+            secs = int(row.get("running_ms", 0) / 1000)
+            fail(f"«{row.get('file') or row['sid']}» is busy — a script has owned its "
+                 f"JS thread for {secs}s",
+                 "wait. Figma cannot interrupt a running plugin script, and it usually "
+                 "returns on its own; only this file is blocked. If it never does: "
+                 f"figmosha sessions --reset {row['sid']}")
+        return 1
+
     if len(rows) > 1:
         print()
         print("  Several files are open, so a bare command has no single target.")
@@ -1163,17 +1264,34 @@ def cmd_doctor(args):
     status, r = _exec("return 1 + 1;", 10, want_value=True)
     if not r.get("ok") or r.get("value") != 2:
         fail(f"round trip failed: {r.get('error', r)}",
-             "close the plugin window in Figma and run it again")
+             "if it mentions `busy`, wait — this file is still running an earlier "
+             "script. Otherwise close the plugin window in Figma and run it again")
         return 1
     ok(f"round trip works ({r.get('elapsed_ms', '?')}ms)")
 
     status, r = _exec(
         "return {file: figma.root.name, page: figma.currentPage.name, "
-        "pages: figma.root.children.length};", 10, want_value=True)
+        "pages: figma.root.children.length, "
+        "helpers: typeof h.walk === 'function'};", 10, want_value=True)
     if r.get("ok"):
         v = r.get("value") or {}
         ok(f"editing «{v.get('file')}» — page «{v.get('page')}» "
            f"of {v.get('pages')}")
+        # The manifest is the only honest source for this: the plugin cannot
+        # read its own documentAccess, and how much memory a scan costs before
+        # it starts follows directly from it.
+        access = _manifest_document_access()
+        if access == "dynamic-page":
+            ok("documentAccess: dynamic-page — pages load when something asks")
+        else:
+            fail("documentAccess: legacy — Figma preloaded every page of this file "
+                 "before the plugin's first line",
+                 "on a big file that is most of an out-of-memory crash spent up front. "
+                 "Move over: python figmosha.py init --document-access dynamic-page "
+                 "(then re-import the plugin). See CLAUDE.md → Dynamic pages")
+        if not v.get("helpers"):
+            fail("this plugin predates h.walk",
+                 "re-Run the plugin in Figma to pick up the current code.js")
         print("\n  The plugin is bound to whichever file was open when you ran it.")
         print("  Switched files? Run the plugin again in the new one.")
     return 0
@@ -1221,7 +1339,16 @@ def _choose_port(name, existing, requested):
                      f"{project.PORT_BASE}..{project.PORT_BASE + project.PORT_SPAN - 1}")
 
 
-def _write_manifest(name, port):
+def _manifest_document_access():
+    """What the imported plugin's manifest says, or None if it cannot be read."""
+    try:
+        with open(project.ROOT / "plugin" / "manifest.json", encoding="utf-8") as f:
+            return json.load(f).get("documentAccess", "legacy")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_manifest(name, port, document_access="dynamic-page"):
     """Patch the plugin manifest in place; returns (path, old_id, new_id).
 
     Patched rather than generated from a template so that permissions,
@@ -1237,6 +1364,20 @@ def _write_manifest(name, port):
     m.setdefault("networkAccess", {})["allowedDomains"] = [
         f"http://localhost:{port}", f"ws://localhost:{port}",
     ]
+    # Without this field Figma guarantees the whole document is loaded before
+    # the plugin's first line runs — every page, every node, 20–30 s of it, and
+    # it is never released. On a 15-page file that is most of an out-of-memory
+    # crash spent before a single command has been sent. With it, pages load
+    # when something asks for them; h.resolve does the asking.
+    #
+    # The cost is that the synchronous lookups throw: .mainComponent,
+    # getNodeById, component.instances and friends. Everything under h.* is
+    # already async, so this only bites hand-written exec scripts — which is
+    # what `legacy` is for while they are being migrated.
+    if document_access == "legacy":
+        m.pop("documentAccess", None)
+    else:
+        m["documentAccess"] = document_access
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(m, f, ensure_ascii=False, indent=2)
@@ -1386,9 +1527,15 @@ def cmd_init(args, previous_id=None):
     cfg["name"] = name
     cfg["port"] = port
     cfg.setdefault("created", date.today().isoformat())
+    # Sticky, like the port: `update` re-stamps the manifest from the
+    # repository's default, and a project that deliberately stayed on legacy
+    # must not be moved back by a routine pull.
+    if getattr(args, "document_access", None):
+        cfg["document_access"] = args.document_access
+    document_access = cfg.get("document_access", "dynamic-page")
     cfg_path = project.save(cfg)
 
-    manifest_path, old_id, new_id = _write_manifest(name, port)
+    manifest_path, old_id, new_id = _write_manifest(name, port, document_access)
     if previous_id is not None:
         old_id = previous_id
     _write_ui(port)
@@ -1396,6 +1543,13 @@ def cmd_init(args, previous_id=None):
     print(f"  ✓  {cfg_path.name:<22} {name}, port {port} ({why})")
     print(f"  ✓  {'plugin/manifest.json':<22} id {new_id} · «Figmosha · {name}»")
     print(f"  ✓  {'plugin/ui.html':<22} ws://localhost:{port}/plugin")
+    if document_access == "legacy":
+        print(f"  !  {'documentAccess':<22} legacy — Figma preloads the whole document "
+              f"on the first run")
+        print(f"     {'':<22} (deprecated; see CLAUDE.md → Dynamic pages)")
+    else:
+        print(f"  ✓  {'documentAccess':<22} {document_access} — pages load when something "
+              f"asks for them")
     print()
 
     if old_id != new_id:
@@ -1415,6 +1569,9 @@ def cmd_sessions(args):
     # a `*` that means something other than "this is where commands go" is
     # worse than no marker at all, and a name prefix like `kite` for «Kite
     # folio» is exactly the case where the two implementations drifted apart.
+    if args.reset:
+        return _reset_session(args.reset)
+
     path = "/sessions" + (f"?session={urllib.parse.quote(SESSION)}" if SESSION else "")
     status, resp = _request("GET", path)
     if status == 404:
@@ -1429,15 +1586,50 @@ def cmd_sessions(args):
         print("no Figma file connected — run the plugin in Figma")
         return 1
     matched = resp.get("matched")
+    # File name first: it is what a human addresses a session by, and unlike
+    # the sid it survives re-running the plugin.
     for row in rows:
         marker = "*" if matched is not None and row["sid"] in matched else " "
-        print(f"{marker} {row['sid']:<18} «{row.get('file') or '?'}»"
-              f" — page «{row.get('page') or '?'}»"
+        state = "idle"
+        if row.get("busy"):
+            state = f"BUSY {int(row.get('running_ms', 0) / 1000)}s"
+            if row.get("orphaned"):
+                state += " (its caller gave up)"
+            elif not row.get("started", True):
+                state += " (dispatched, not started)"
+        print(f"{marker} «{row.get('file') or '?'}»  {row['sid']}"
+              f"  page «{row.get('page') or '?'}»  {state}"
               f"  pending {row.get('pending', 0)}  {row.get('age_s', 0)}s")
+    if any(r.get("busy") for r in rows):
+        print("  BUSY means a script still owns that file's JS thread. Figma cannot "
+              "interrupt it;\n  it usually returns on its own. `figmosha sessions "
+              "--reset <sid>` only clears the\n  bridge's memory of it — the script "
+              "keeps running.", file=sys.stderr)
     if SESSION and matched is not None and len(matched) != 1:
         print(f"figmosha: FIGMOSHA_SESSION={SESSION!r} matches {len(matched)} of them — "
               f"commands will be refused until it matches exactly one", file=sys.stderr)
         return 1
+    return 0
+
+
+def _reset_session(sid):
+    """Make the bridge forget what a wedged session is running. Last resort."""
+    status, resp = _request("POST", f"/sessions/{urllib.parse.quote(sid)}/reset")
+    if status == 404:
+        print(f"figmosha: {resp.get('error', 'no such session')}", file=sys.stderr)
+        for row in resp.get("sessions") or []:
+            print(f"   {row['sid']:<18} «{row.get('file') or '?'}»", file=sys.stderr)
+        return 1
+    if status != 200:
+        print(f"figmosha: {resp.get('error', 'reset failed')}", file=sys.stderr)
+        return 1
+    cleared = resp.get("cleared") or []
+    if not cleared:
+        print(f"{sid}: nothing was running")
+        return 0
+    for c in cleared:
+        print(f"{sid}: forgot {c['rid']} after {int(c['running_ms'] / 1000)}s")
+    print(f"  ! {resp.get('warning', '')}", file=sys.stderr)
     return 0
 
 
@@ -1449,24 +1641,63 @@ def prelude(assignments):
 
     A script kept in a file almost always needs one or two ids from the caller,
     and the alternative is editing the file before every run — a step in four
-    skills, and a copy of the script per invocation. The value is JSON when it
-    parses as JSON and a string when it does not, so `--set N=[0,4,8]` is an
-    array and `--set ID=185:21880` is not a syntax error.
+    skills, and a copy of the script per invocation.
+
+    Three spellings, because guessing is right most of the time and wrong
+    expensively:
+
+      --set      JSON when it parses, a string when it does not. `--set N=[0,4,8]`
+                 is an array; `--set ID=185:21880` is not a syntax error. The
+                 trap is `--set KEYS={"a":"b"}`, which arrives as an object, so
+                 a script that calls JSON.parse(KEYS) throws.
+      --set-str  always a string. This is the fix for the trap above.
+      --set-json always JSON; a value that does not parse is an error here
+                 rather than a silent string that breaks two lines later.
+
+    `NAME=@path` reads the value from a file, which is how a long key list gets
+    past the command-line length limit (~8k on Windows) and past quoting.
     """
     lines = []
     for item in assignments or []:
+        # Plain strings mean --set, so callers that predate the other two forms
+        # (and the tests that pin them) keep working unchanged.
+        mode, item = item if isinstance(item, tuple) else ("auto", item)
         if "=" not in item:
             raise ValueError(f"expected NAME=value, got {item!r}")
         name, raw = item.split("=", 1)
         name = name.strip()
         if not IDENTIFIER.match(name):
             raise ValueError(f"{name!r} is not a JS identifier — cannot be a const name")
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
+        if raw.startswith("@"):
+            try:
+                raw = Path(raw[1:]).read_text(encoding="utf-8")
+            except OSError as e:
+                raise ValueError(f"{name}=@{raw[1:]}: {e}")
+        if mode == "str":
             value = raw
+        elif mode == "json":
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"--set-json {name}: not valid JSON ({e})")
+        else:
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError:
+                value = raw
         lines.append(f"const {name} = {json.dumps(value, ensure_ascii=False)};")
     return "\n".join(lines) + ("\n" if lines else "")
+
+
+class SetAction(argparse.Action):
+    """Collect --set / --set-str / --set-json into one list, in typed order."""
+
+    MODES = {"--set": "auto", "--set-str": "str", "--set-json": "json"}
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        current = getattr(namespace, self.dest, None) or []
+        setattr(namespace, self.dest,
+                current + [(self.MODES.get(option_string, "auto"), value)])
 
 
 def cmd_exec(args):
@@ -1485,7 +1716,7 @@ def cmd_exec(args):
     except ValueError as e:
         print(f"figmosha: {e}", file=sys.stderr)
         return 2
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_tree(args):
@@ -1501,7 +1732,7 @@ def cmd_tree(args):
         f"if (!n) throw new Error('node not found: ' + {json.dumps(args.node_id)});"
         f"return h.dumpTree(n, {opts});"
     )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_find(args):
@@ -1537,28 +1768,64 @@ def cmd_find(args):
             print(f"figmosha: unknown filter key '{key}'. Use name, type, text", file=sys.stderr)
             return 2
 
+    # h.walk, not root.findAll: findAll is synchronous, returns every match as
+    # a live node proxy, and descends into instances — which is where the
+    # volume is. One frame in the file this was measured on holds 53 439
+    # instances, and 0 of 339 real hits were nested inside one. h.walk prunes
+    # there by default, checks the caller's deadline between nodes, and hands
+    # back rows rather than proxies.
+    prune = "false" if args.nested else "true"
+    opts = f"{{pruneInstances: {prune}, includeRoot: false}}"
     preamble = (
         f"const root = {node_expr(args.node_id)};"
         f"if (!root) throw new Error('node not found: ' + {json.dumps(args.node_id)});"
-        f"if (!root.findAll) throw new Error('node has no findAll (type: ' + root.type + ')');"
-        f"const found = root.findAll(n => {predicate});"
+        f"const hit = n => {predicate};"
     )
-    if args.raw:
+    stopped = (
+        "(r.partial"
+        " ? '\\n… stopped after ' + r.visited + ' nodes (' + r.reason + ')"
+        " — scan a smaller subtree, or raise --timeout' : '')"
+    )
+    if args.count:
+        # Counting must not build the array at all: the count is often the
+        # whole question, and on a big subtree the array is the cost.
+        code = (
+            f"{preamble}"
+            f"let count = 0;"
+            f"const r = await h.walk(root, n => {{ if (hit(n)) count++; }}, {opts});"
+            f"return count + ' found (' + r.visited + ' nodes visited)' + {stopped};"
+        )
+    elif args.raw:
         # --raw is an explicit ask for the structure, and a truncated array is
         # worse than a long one: nothing in it says a tail is missing.
-        code = f"{preamble}return found.map({NODE_FIELDS_JS});"
+        code = (
+            f"{preamble}"
+            f"const r = await h.walk(root, n => hit(n) ? ({NODE_FIELDS_JS})(n) : undefined,"
+            f" {opts});"
+            f"return r;"
+        )
     else:
+        # Only when it actually happened: a note on every search is noise, and
+        # a search that met no instances has nothing to disclose.
+        pruned_note = (
+            "" if args.nested else
+            " + (r.pruned ? '\\n(' + r.pruned + ' instance(s) not descended"
+            " — --nested looks inside them)' : '')"
+        )
         code = (
             f"{ROW_JS}{preamble}"
+            f"const r = await h.walk(root, n => hit(n) ? row(n) : undefined, {opts});"
+            f"const found = r.found;"
             f"const LIMIT = {args.limit};"
             f"const shown = found.slice(0, LIMIT);"
             f"return found.length + ' found'"
-            f" + (shown.length ? '\\n' + shown.map(row).join('\\n') : '')"
+            f" + (shown.length ? '\\n' + shown.join('\\n') : '')"
             f" + (found.length > LIMIT"
             f"    ? '\\n… showing ' + LIMIT + ' of ' + found.length +"
-            f"      ' — narrow the filter, or --limit ' + found.length : '');"
+            f"      ' — narrow the filter, or --limit ' + found.length : '')"
+            f" + {stopped}{pruned_note};"
         )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_text(args):
@@ -1570,7 +1837,7 @@ def cmd_text(args):
         f"await h.setText(n, {json.dumps(args.text)});"
         f"return {{id: n.id, before, after: n.characters}};"
     )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def _mutate(args, mode):
@@ -1593,7 +1860,7 @@ def _mutate(args, mode):
             .replace("__PAIRS__", json.dumps(pairs))
             .replace("__MODE__", json.dumps(mode))
             .replace("__DRY__", "true" if args.dry_run else "false"))
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_set(args):
@@ -1606,12 +1873,12 @@ def cmd_bind(args):
 
 def cmd_overrides(args):
     code = OVERRIDES_JS.replace("__ID__", json.dumps(args.node_id))
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_where(args):
     code = WHERE_JS.replace("__ID__", json.dumps(args.node_id))
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_variant(args):
@@ -1632,7 +1899,7 @@ def cmd_variant(args):
         f"for (const k in n.componentProperties) out[k] = n.componentProperties[k].value;"
         f"return {{id: n.id, applied: {json.dumps(props)}, current: out}};"
     )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_clone(args):
@@ -1651,7 +1918,7 @@ def cmd_clone(args):
         f"figma.viewport.scrollAndZoomIntoView([n, c]);"
         f"return {{clone_id: c.id, x: c.x, y: c.y, name: c.name}};"
     )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 def cmd_rm(args):
@@ -1680,18 +1947,239 @@ def cmd_rm(args):
         f"  (removed.length ? ' (removed ' + removed.length + ' before that)' : ''));"
         f"return removed;"
     )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
+
+
+
+# ─── each: one script over a subtree, a unit at a time ─────────────────────
+
+def _children_of(node_id, timeout):
+    """List one node's direct children. Returns (rows, error_exit_code).
+
+    This is the cheap operation the whole runner is built on: reading
+    `n.children` does no deep walk, while `findAll` on the same node walks
+    everything below it. Choosing the unit of work up front therefore costs
+    nothing, and discovering it after a 100-second overrun costs minutes of a
+    blocked file — and sometimes the plugin.
+    """
+    code = (
+        f"const n = {node_expr(node_id)};"
+        f"if (!n) throw new Error('node not found: ' + {json.dumps(node_id)});"
+        f"return (n.children || []).map(c => ({{id: c.id, name: c.name, type: c.type}}));"
+    )
+    status, resp = _exec(code, timeout, want_value=True)
+    if resp.get("ok") is False:
+        print(f"figmosha: {resp.get('error', 'could not list children')}", file=sys.stderr)
+        return None, _exit_code(status, resp)
+    return resp.get("value") or [], None
+
+
+def _split_ahead(root_id, levels, timeout):
+    """Descend `levels` levels of children and return the leaves to run over."""
+    frontier = [{"id": root_id, "name": root_id, "type": "ROOT"}]
+    for _ in range(max(levels, 0)):
+        nxt = []
+        for node in frontier:
+            kids, err = _children_of(node["id"], timeout)
+            if err is not None:
+                return None, err
+            # A node with no children is a unit in its own right, not a gap.
+            nxt.extend(kids if kids else [node])
+        frontier = nxt
+    return frontier, None
+
+
+def _load_state(path):
+    """Ids this run already finished, from a previous attempt's state file."""
+    done = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("status") == "ok":
+                    done[rec.get("id")] = rec
+    except FileNotFoundError:
+        pass
+    return done
+
+
+def cmd_each(args):
+    """Run one script over a subtree, one piece at a time, writing state as it goes.
+
+    Every long run this was built from has been interrupted at least once — by
+    an overrun, by a plugin that went away when someone switched files, by an
+    out-of-memory crash. What turned those into delays rather than restarts was
+    writing down each unit as it finished, so that is what this does. Plus the
+    two rules that keep a run alive:
+
+      * split before the overrun, not after. `--split N` descends N levels of
+        children first, because listing children is free and a page-sized unit
+        is not small enough for a mockup file.
+      * a busy file means "go smaller", not "failed". A unit that times out is
+        not retried — it is split into its children and they are queued ahead
+        of everything else, so the branch finishes before the run moves on.
+    """
+    try:
+        code = Path(args.file).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"figmosha: {e}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        extra = prelude(args.set)
+    except ValueError as e:
+        print(f"figmosha: {e}", file=sys.stderr)
+        return EXIT_USAGE
+
+    # A long run loses the plugin sooner or later — switching files in Figma
+    # closes its window — so waiting for it is the default here, unlike
+    # everywhere else where failing fast is the friendlier answer.
+    global WAIT_PLUGIN
+    if not WAIT_PLUGIN:
+        WAIT_PLUGIN = 300
+
+    state = open(args.state, "a", encoding="utf-8") if args.state else None
+    done = _load_state(args.state) if (args.state and args.resume) else {}
+    if done:
+        print(f"figmosha: resuming — {len(done)} unit(s) already done", file=sys.stderr)
+
+    units, err = _split_ahead(args.node_id, args.split, args.timeout)
+    if err is not None:
+        if state:
+            state.close()
+        return err
+    print(f"figmosha: {len(units)} unit(s) after splitting {args.split} level(s)",
+          file=sys.stderr)
+
+    queue = [dict(u, depth=0) for u in units]
+    tally = {"ok": 0, "failed": 0, "split": 0, "skipped": 0}
+    outcome = 0
+
+    def write(rec):
+        if state:
+            state.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            state.flush()      # after every unit: the next one may be the crash
+
+    try:
+        while queue:
+            unit = queue.pop(0)
+            if unit["id"] in done:
+                tally["skipped"] += 1
+                continue
+
+            body = prelude([("str", f"ROOT_ID={unit['id']}")]) + extra + code
+            t0 = time.monotonic()
+            status, resp = _exec(body, args.timeout, want_value=True)
+            rc = _exit_code(status, resp)
+            ms = int((time.monotonic() - t0) * 1000)
+            label = f"{unit['id']} «{unit.get('name', '?')}»"
+
+            if rc == 0:
+                tally["ok"] += 1
+                print(f"  ok    {label}  {ms}ms", file=sys.stderr)
+                write({"id": unit["id"], "name": unit.get("name"),
+                       "status": "ok", "ms": ms, "value": resp.get("value")})
+                continue
+
+            if rc == EXIT_BUSY:
+                # Not a retry: the same unit would overrun again, and each
+                # overrun costs the file's thread for minutes. Go smaller.
+                if unit["depth"] >= args.max_split:
+                    tally["failed"] += 1
+                    outcome = EXIT_BUSY
+                    print(f"  FAIL  {label}  too slow, and already split "
+                          f"{unit['depth']} time(s)", file=sys.stderr)
+                    write({"id": unit["id"], "name": unit.get("name"),
+                           "status": "failed", "ms": ms,
+                           "error": resp.get("error")})
+                    continue
+                # Generously, and on purpose. The unit that just overran still
+                # owns the file's thread, so this listing has to wait that out
+                # — asking with the unit's own budget would hit the same busy
+                # plugin and report "cannot be split", which is a wrong answer
+                # to a question we never got to ask.
+                kids, kerr = _children_of(unit["id"], max(args.timeout * 5, 120))
+                if kerr is not None:
+                    tally["failed"] += 1
+                    outcome = kerr
+                    print(f"  FAIL  {label}  too slow, and the file never freed up "
+                          f"long enough to list its children", file=sys.stderr)
+                    write({"id": unit["id"], "name": unit.get("name"),
+                           "status": "failed", "ms": ms,
+                           "error": "could not list children to split"})
+                    continue
+                if not kids:
+                    tally["failed"] += 1
+                    outcome = EXIT_BUSY
+                    print(f"  FAIL  {label}  too slow, and it has no children to "
+                          f"split into", file=sys.stderr)
+                    write({"id": unit["id"], "name": unit.get("name"),
+                           "status": "failed", "ms": ms, "error": resp.get("error")})
+                    continue
+                tally["split"] += 1
+                print(f"  split {label}  → {len(kids)} child(ren)", file=sys.stderr)
+                write({"id": unit["id"], "name": unit.get("name"),
+                       "status": "split", "ms": ms, "into": [k["id"] for k in kids]})
+                # Depth-first: finish this branch before moving on, so a run
+                # that is interrupted has whole subtrees done rather than a
+                # scattering of pieces.
+                queue = [dict(k, depth=unit["depth"] + 1) for k in kids] + queue
+                continue
+
+            if rc == EXIT_NO_PLUGIN:
+                # _exec already waited; if we are still here it is not coming
+                # back, and going on would just fail every remaining unit.
+                tally["failed"] += 1
+                print(f"  FAIL  {label}  plugin gone — run it in Figma and "
+                      f"re-run with --resume", file=sys.stderr)
+                write({"id": unit["id"], "name": unit.get("name"),
+                       "status": "failed", "error": resp.get("error")})
+                outcome = EXIT_NO_PLUGIN
+                break
+
+            tally["failed"] += 1
+            print(f"  FAIL  {label}  {resp.get('error', 'unknown')}", file=sys.stderr)
+            if resp.get("hint"):
+                print(f"        hint: {resp['hint']}", file=sys.stderr)
+            write({"id": unit["id"], "name": unit.get("name"),
+                   "status": "failed", "ms": ms, "error": resp.get("error")})
+            outcome = EXIT_SCRIPT
+            if not args.keep_going:
+                # A script error is usually the script, not the subtree: the
+                # next 400 units would fail the same way, slowly.
+                print("figmosha: stopping on the first script error "
+                      "(--keep-going to carry on)", file=sys.stderr)
+                break
+    finally:
+        if state:
+            state.close()
+
+    print(f"figmosha: {tally['ok']} ok, {tally['split']} split, "
+          f"{tally['failed']} failed, {tally['skipped']} skipped"
+          + (f" — state in {args.state}" if args.state else ""), file=sys.stderr)
+    return outcome
 
 
 def cmd_import_component(args):
+    # Through h.importComp, not the raw API: importing a key that belongs to
+    # another file and was never published never settles — no error, no return.
+    # h.importComp races it against a timer so this fails in seconds with an
+    # explanation instead of sitting there until the CLI gives up.
     code = (
-        f"const comp = await figma.importComponentByKeyAsync({json.dumps(args.key)});"
+        f"const comp = await h.importComp({json.dumps(args.key)},"
+        f" {{timeout: {args.import_timeout * 1000}}});"
         f"const inst = comp.createInstance();"
         f"figma.currentPage.appendChild(inst);"
         f"figma.viewport.scrollAndZoomIntoView([inst]);"
         f"return {{component: comp.name, instance_id: inst.id, w: inst.width, h: inst.height}};"
     )
-    return _emit(_exec(code, args.timeout, want_value=args.raw)[1], raw=args.raw)
+    return _send(code, args)
 
 
 # ─── argparse / dispatch ───────────────────────────────────────────────────
@@ -1710,6 +2198,10 @@ def build_parser():
                     help="bridge port (env FIGMOSHA_PORT)")
     ap.add_argument("--session", default=DEFAULT_SESSION,
                     help="which open Figma file to talk to (env FIGMOSHA_SESSION)")
+    ap.add_argument("--wait-plugin", type=int, default=DEFAULT_WAIT_PLUGIN,
+                    metavar="N",
+                    help="if the plugin is gone, wait up to N seconds for it to come "
+                         "back instead of failing (env FIGMOSHA_WAIT_PLUGIN)")
 
     sub = ap.add_subparsers(dest="cmd")
 
@@ -1717,15 +2209,24 @@ def build_parser():
         "update", help="git pull, then stamp this project's identity back into the plugin")
     # cmd_update ends in cmd_init, which reads these; without them `update`
     # would need its own copy of the stamping logic.
-    p_update.set_defaults(name=None, port=None)
+    p_update.set_defaults(name=None, port=None, document_access=None)
 
     p_init = sub.add_parser("init", help="claim this copy for a project (port + plugin id)")
     p_init.add_argument("--name", help="project name (default: the folder's)")
     p_init.add_argument("--port", type=int, help="override the derived port")
+    p_init.add_argument("--document-access", choices=("dynamic-page", "legacy"),
+                        help="dynamic-page (default) loads pages on demand. legacy makes "
+                             "Figma preload the whole document before the plugin runs — "
+                             "only for a project whose exec scripts still use the "
+                             "synchronous APIs; see CLAUDE.md → Dynamic pages")
 
     p_status = sub.add_parser("status")
     p_status.add_argument("--raw", action="store_true", help="print full JSON response")
-    sub.add_parser("sessions", help="which Figma files are connected right now")
+    p_sessions = sub.add_parser(
+        "sessions", help="which Figma files are connected, and which are busy")
+    p_sessions.add_argument("--reset", metavar="SID",
+                            help="make the bridge forget what this session is running "
+                                 "— it does not stop the script (last resort)")
 
     p_doctor = sub.add_parser("doctor", help="diagnose the bridge -> plugin -> Figma chain")
     _add_common_flags(p_doctor)
@@ -1739,8 +2240,16 @@ def build_parser():
     g.add_argument("code", nargs="?")
     g.add_argument("--file", "-f")
     g.add_argument("--stdin", action="store_true")
-    p_exec.add_argument("--set", action="append", metavar="NAME=value",
-                        help="define a const before the code (repeatable)")
+    p_exec.add_argument("--set", dest="set", action=SetAction, metavar="NAME=value",
+                        help="define a const before the code, JSON when it parses and a "
+                             "string when it does not; NAME=@file reads the value from a "
+                             "file (repeatable)")
+    p_exec.add_argument("--set-str", dest="set", action=SetAction, metavar="NAME=value",
+                        help="same, but always a string — use it for ids and for JSON "
+                             "text your script parses itself")
+    p_exec.add_argument("--set-json", dest="set", action=SetAction, metavar="NAME=value",
+                        help="same, but always JSON — a value that does not parse is an "
+                             "error here rather than a surprise in the script")
 
     p_tree = sub.add_parser("tree")
     _add_common_flags(p_tree)
@@ -1781,6 +2290,12 @@ def build_parser():
     p_find.add_argument("filter", help="name=X | name~X | type=X | text=X | text~X")
     p_find.add_argument("--limit", type=int, default=100,
                         help="rows to print before saying how many were left out")
+    p_find.add_argument("--nested", action="store_true",
+                        help="descend into instances too. Off by default: an instance's "
+                             "children are copies that came with its component, not "
+                             "placements, and they are where a big file's node count is")
+    p_find.add_argument("--count", action="store_true",
+                        help="just how many, without building the list of matches")
 
     p_text = sub.add_parser("text")
     _add_common_flags(p_text)
@@ -1823,10 +2338,41 @@ def build_parser():
     _add_common_flags(p_rm)
     p_rm.add_argument("node_ids", nargs="+", help="one or more node ids, or `sel`")
 
+    p_each = sub.add_parser(
+        "each", help="run one script over a subtree, a unit at a time, resumably")
+    _add_common_flags(p_each)
+    p_each.add_argument("node_id", help="the subtree to cover, or `page` / `sel`")
+    p_each.add_argument("--file", "-f", required=True,
+                        help="the script to run for each unit; it gets ROOT_ID")
+    p_each.add_argument("--split", type=int, default=1, metavar="N",
+                        help="descend N levels of children before running anything "
+                             "(default 1). Listing children is free; discovering the "
+                             "right size after an overrun is not")
+    p_each.add_argument("--state", metavar="FILE",
+                        help="append one JSON line per unit here, as it finishes")
+    p_each.add_argument("--resume", action="store_true",
+                        help="skip units this state file already records as done")
+    p_each.add_argument("--keep-going", action="store_true",
+                        help="carry on after a script error instead of stopping")
+    p_each.add_argument("--max-split", type=int, default=4, metavar="N",
+                        help="how many times a unit may be split before it is called "
+                             "failed (default 4)")
+    p_each.add_argument("--set", dest="set", action=SetAction, metavar="NAME=value",
+                        help="extra consts for the script, as in `exec`")
+    p_each.add_argument("--set-str", dest="set", action=SetAction, metavar="NAME=value",
+                        help="the same, always as a string")
+    p_each.add_argument("--set-json", dest="set", action=SetAction, metavar="NAME=value",
+                        help="the same, always as JSON")
+
     for name in ("import-component", "icomp"):
         p = sub.add_parser(name)
         _add_common_flags(p)
         p.add_argument("key")
+        # 20s, not 60: a key that is going to resolve does so in under a second
+        # (measured 4–907 ms), and one that never settles costs the full wait.
+        p.set_defaults(timeout=25)
+        p.add_argument("--import-timeout", type=int, default=20, metavar="N",
+                       help="give up on the import after N seconds (default 20)")
 
     return ap
 
@@ -1852,10 +2398,11 @@ def main():
         ap.print_help()
         sys.exit(2)
 
-    global HOST, PORT, SESSION
+    global HOST, PORT, SESSION, WAIT_PLUGIN
     HOST = args.host
     PORT = args.port
     SESSION = args.session
+    WAIT_PLUGIN = args.wait_plugin
 
     dispatch = {
         "init": cmd_init,
@@ -1868,6 +2415,7 @@ def main():
         "vars": cmd_vars,
         "styles": cmd_styles,
         "exec": cmd_exec,
+        "each": cmd_each,
         "tree": cmd_tree,
         "find": cmd_find,
         "set": cmd_set,

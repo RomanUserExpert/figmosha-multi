@@ -38,7 +38,10 @@ Replaces the `figma-console` / `figma-mcp` columns row for row.
 | Navigate to file | **Not available.** The plugin is bound to the file it was run in and does not follow a URL. Verify the open file by name; if it is the wrong one, ask the user to open the right file and Run the plugin there. |
 | Execute Plugin JS | `./figmosha exec --file <script.js>` — **JS is identical to both MCP columns, no wrapper changes.** `return …` is the result, `print(…)` collects logs, `await` works everywhere, and `h.*` helpers are in scope. Pass values in with `--set NAME=value` (emitted as a `const` before the code). |
 | Take screenshot | `exportAsync({format:"PNG", constraint:{type:"SCALE", value:2}})` inside an exec, base64 out, decoded straight to disk — never through the conversation. Skills use screenshots only for visual confirmation; prefer reading the value back instead. |
-| Search components | Open file only: `./figmosha find <root-id> type=COMPONENT_SET` / `name~Foo`, or an exec over `figma.root.findAll(…)`. **There is no cross-library component search** — the library must be the open session. See *firstrun* below. |
+| Search components | Open file only: `./figmosha find <root-id> type=COMPONENT_SET` / `name~Foo`, or an exec over `figma.root.findAll(…)` — which needs
+`await figma.loadAllPagesAsync()` first under `documentAccess: dynamic-page`, and
+brings the whole document into memory with it. On a large file prefer `h.pages()`
+plus `h.loadPageOf(page)` one page at a time, or `figmosha each`. **There is no cross-library component search** — the library must be the open session. See *firstrun* below. |
 | Get file / component data | `./figmosha tree <id> [--depth N] [--layout]`, `./figmosha props <id> [-c]`, `./figmosha where <id>`, `./figmosha overrides <id>`. |
 | Get variables (file-wide) | `./figmosha vars [filter] [--type T]`, `--library` for collections this file consumes. |
 | Get token values | Same command — `vars` resolves per mode. |
