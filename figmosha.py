@@ -1436,6 +1436,10 @@ def cmd_update(args):
         print("   update it by copying the new files over (all but project.json),",
               file=sys.stderr)
         print("   then run:  python figmosha.py init", file=sys.stderr)
+        print("   and if plugin/manifest.json was among them, re-IMPORT the plugin in",
+              file=sys.stderr)
+        print("   Figma rather than re-Running it — a manifest change needs the import",
+              file=sys.stderr)
         return 2
 
     code, dirty = _git("status", "--porcelain", "--untracked-files=no")

@@ -1,4 +1,4 @@
-# Figmosha 2.4 — Claude Code instructions
+# Figmosha 3.0 — Claude Code instructions
 
 Drive Figma by sending JS through a local bridge connected to a plugin running
 inside Figma Desktop.

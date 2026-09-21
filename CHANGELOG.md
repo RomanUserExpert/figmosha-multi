@@ -9,14 +9,25 @@ code it started with, so new helpers won't exist until you do. If
 `plugin/manifest.json` changed, re-*import* it rather than just re-running, and
 re-run `figmosha init` so the copy's project identity survives the update.
 
-## [Unreleased]
+## [3.0.0] — 2026-09-21
+
+2.4 made the everyday task cheap. This release is about the file that defeats
+all of it: a 15-page mockup where one frame holds **53 439** instances, a scan
+resolved **876 849** main components, and the tab ran out of memory. The
+failure modes are written up in
+[`figmosha-problems/README.md`](figmosha-problems/README.md); what follows is
+the answer to them.
+
+The measure of this release is one thing: a scan that used to end in a crash
+should end in a result, and an interruption should cost a delay rather than a
+restart.
+
+**Upgrading: re-import the plugin**, do not just re-Run it. `manifest.json`
+gained `documentAccess`, and a manifest change is not picked up by a Run
+however many times you press it. `python figmosha.py update` says so on its
+own.
 
 ### Surviving a big file
-
-Everything here comes out of one measured run: a 15-page mockup file where one
-frame holds 53 439 instances, a scan resolved 876 849 main components, and the
-tab ran out of memory. The failure modes are written up in
-`figmosha-problems/README.md`; this is the answer to them.
 
 **Breaking.** Four changes, each with a migration:
 
