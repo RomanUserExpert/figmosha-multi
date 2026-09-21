@@ -1488,7 +1488,9 @@ def cmd_update(args):
     _, changed = _git("diff", "--name-only", f"{before}..{after}")
     changed = changed.splitlines()
 
-    rc = cmd_init(args, previous_id=imported_id)
+    # Quiet about the follow-up: which of re-Run and re-import is needed
+    # depends on what the pull changed, and only this function knows that.
+    rc = cmd_init(args, previous_id=imported_id, announce_next=False)
 
     # A manifest change is the difference between "re-Run the plugin" and
     # "remove it in Figma and import it again", and getting that wrong looks
@@ -1512,13 +1514,19 @@ def _manifest_id():
         return None
 
 
-def cmd_init(args, previous_id=None):
+def cmd_init(args, previous_id=None, announce_next=True):
     """Claim this copy for a project: its own port, its own plugin entry.
 
     `previous_id` is for `update`, which has just overwritten the manifest with
     the repository's default: the id in the file is then no longer the id Figma
     imported, and comparing against it would advise a re-import that is not
     needed. The caller that knows better says so.
+
+    `announce_next` is for the same caller. `update` knows which files the pull
+    touched, so it can tell "re-Run" from "re-import"; this function can only
+    see that the identity did not change, and would say "re-Run" a line before
+    `update` says "re-IMPORT". Two contradictory instructions are worse than
+    one, and the cheaper-looking one is the wrong one to follow.
     """
     existing = project.load()
     name = args.name or (existing["name"] if existing else _default_name())
@@ -1561,7 +1569,7 @@ def cmd_init(args, previous_id=None):
         print(f"     Import plugin from manifest… → {manifest_path}")
         if existing:
             print(f"     (the id changed from {old_id} — remove the old entry first)")
-    else:
+    elif announce_next:
         print("  →  identity unchanged; re-Run the plugin in Figma")
     print(r"  →  start the bridge:  .\start-bridge.ps1   (bash: ./start-bridge.sh)")
     return 0

@@ -990,7 +990,8 @@ def with_git(monkeypatch, git):
     monkeypatch.setattr(figmosha, "_git", git)
     seen = {"init": 0}
     monkeypatch.setattr(figmosha, "cmd_init",
-                        lambda args, previous_id=None: seen.__setitem__("init", 1) or 0)
+                        lambda args, previous_id=None, announce_next=True:
+                        seen.__setitem__("init", 1) or 0)
     return seen
 
 
@@ -1098,7 +1099,8 @@ def test_update_does_not_invent_a_re_import(monkeypatch, capsys):
     monkeypatch.setattr(figmosha, "_manifest_id", lambda: "figmosha-test")
     passed = {}
     monkeypatch.setattr(figmosha, "cmd_init",
-                        lambda args, previous_id=None: passed.setdefault("id", previous_id) and 0 or 0)
+                        lambda args, previous_id=None, announce_next=True:
+                        passed.setdefault("id", previous_id) and 0 or 0)
     figmosha.cmd_update(parse("update"))
     assert passed["id"] == "figmosha-test", "init must compare against the imported id"
 
@@ -1325,3 +1327,28 @@ def test_each_waits_out_the_busy_thread_before_calling_a_unit_unsplittable(
     split_listing = [t for c, t in budgets if CHILDREN in c and '"page"' not in c]
     assert split_listing and min(split_listing) >= 120, \
         "the split listing must outlast the script that is still running"
+
+
+def test_update_never_prints_two_contradictory_follow_ups(monkeypatch, capsys):
+    """`init` can only see that the identity is unchanged, so it would say
+    "re-Run" a line before `update` says "re-IMPORT". Following the first one
+    leaves Figma running the old manifest, which looks like a failed update."""
+    with_git(monkeypatch, FakeGit(changed="plugin/manifest.json"))
+    figmosha.cmd_update(parse("update"))
+    out = capsys.readouterr().out
+    assert "re-IMPORT" in out
+    assert "re-Run" not in out, "init must not contradict update's own advice"
+
+
+def test_update_asks_init_to_stay_quiet_about_the_follow_up(monkeypatch):
+    """The suppression is explicit, so a plain `init` keeps saying what to do."""
+    monkeypatch.setattr(figmosha, "_git", FakeGit())
+    passed = {}
+
+    def fake_init(args, previous_id=None, announce_next=True):
+        passed["announce"] = announce_next
+        return 0
+
+    monkeypatch.setattr(figmosha, "cmd_init", fake_init)
+    figmosha.cmd_update(parse("update"))
+    assert passed["announce"] is False

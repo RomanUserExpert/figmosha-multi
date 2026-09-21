@@ -9,6 +9,16 @@ code it started with, so new helpers won't exist until you do. If
 `plugin/manifest.json` changed, re-*import* it rather than just re-running, and
 re-run `figmosha init` so the copy's project identity survives the update.
 
+## [3.0.1] — 2026-09-21
+
+`update` told you two different things in a row. `init`, which it calls, can
+only see that the plugin's identity did not change, so it said "re-Run the
+plugin"; `update` then looked at what the pull had actually touched and said
+"re-IMPORT". Following the first one leaves Figma running the old manifest —
+which, on this release, means the whole document is still preloaded — and looks
+exactly like the update not working. `init` now leaves that line to the caller
+that knows.
+
 ## [3.0.0] — 2026-09-21
 
 2.4 made the everyday task cheap. This release is about the file that defeats
