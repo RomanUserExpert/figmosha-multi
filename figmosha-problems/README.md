@@ -13,6 +13,12 @@ consequence of forgetting one of those two facts.
 
 ---
 
+> **2026-09-24, Figmosha 3.0:** the out-of-memory crash comes back even with pruning and
+> only a few hundred `mainOf` calls. See `memory-ceiling-2026-09-24.md`. §2 below names the
+> wrong main cause: it is how heavy each thing you touch is, not how many calls you make.
+
+---
+
 ## 1. The CLI's timeout is not the plugin's timeout
 
 **Symptom.** A request returns `timeout after 100s`. Every request after it also times out,
