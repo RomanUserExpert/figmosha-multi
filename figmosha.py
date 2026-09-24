@@ -99,7 +99,7 @@ WAIT_PLUGIN = DEFAULT_WAIT_PLUGIN
 KNOWN_CMDS = {
     "exec", "status", "doctor", "sel", "tree", "find", "text", "variant",
     "clone", "rm", "import-component", "icomp", "init", "sessions", "props",
-    "vars", "styles", "update", "set", "bind", "overrides", "where", "each",
+    "vars", "styles", "update", "set", "bind", "overrides", "where", "each", "mem",
 }
 
 # Options that belong to the parser itself rather than to a subcommand, and
@@ -181,6 +181,7 @@ EXIT_SCRIPT = 1       # the code threw, or the bridge refused the request
 EXIT_USAGE = 2        # wrong arguments, or no bridge at all
 EXIT_NO_PLUGIN = 3    # no plugin connected, or it vanished mid-request
 EXIT_BUSY = 4         # timed out, or the file is busy with an earlier script
+EXIT_TAB_MEMORY = 5   # `each` stopped before the Figma tab ran out of memory
 
 
 def _exit_code(status, resp):
@@ -1975,6 +1976,154 @@ def cmd_rm(args):
 
 
 
+# ─── tab memory: the one budget a plugin cannot see ───────────────────────
+
+# A Figma file lives in one renderer process of Figma Desktop, and the tab dies
+# with "This file has run out of browser memory" at about 2 GB. Nothing inside
+# the plugin can read that number, and nothing releases it — loaded pages and
+# library components stay until the file is reopened (measured 2026-09-24: a
+# heavy page +638 MB, six new library components +264 MB, switching pages
+# gives nothing back). The process can be read from outside, so that is where
+# the guard lives. Windows only; elsewhere the guard is off and says so.
+
+TAB_LIMIT_MB = 1700
+
+
+def _figma_renderer_pids():
+    """Process ids of Figma Desktop's renderers — one per open tab, plus a few.
+
+    One PowerShell call, because only the command line tells a renderer from
+    the GPU process, and the GPU process is the second-largest Figma process.
+    """
+    if os.name != "nt":
+        return []
+    import subprocess
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name LIKE 'Figma%.exe'\" | "
+          "Where-Object { $_.CommandLine -match '--type=renderer' } | "
+          "ForEach-Object { $_.ProcessId }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(x) for x in out.split() if x.strip().isdigit()]
+
+
+def _private_mb(pid):
+    """Private bytes of one process in MB, or None if it is gone."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (n, ctypes.c_size_t) for n in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+                "PrivateUsage")]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    handle = k32.OpenProcess(0x1000 | 0x0010, False, pid)  # query-limited | vm-read
+    if not handle:
+        return None
+    try:
+        c = Counters()
+        c.cb = ctypes.sizeof(c)
+        if not k32.K32GetProcessMemoryInfo(handle, ctypes.byref(c), c.cb):
+            return None
+        code = wintypes.DWORD()
+        if k32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:
+            return None                     # 259 = STILL_ACTIVE
+        return c.PrivateUsage // (1024 * 1024)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _figma_tabs():
+    """[(pid, private MB)] of Figma renderers, largest first."""
+    rows = [(pid, _private_mb(pid)) for pid in _figma_renderer_pids()]
+    return sorted([r for r in rows if r[1] is not None], key=lambda r: -r[1])
+
+
+class TabGuard:
+    """Watches the Figma tab a run is working in, between units.
+
+    Which renderer is the tab is a guess — the largest one — because nothing
+    ties a plugin session to a process id. It is right whenever the file being
+    scanned is the heavy one open, which is the only case the guard is for;
+    `--tab-pid` settles it otherwise.
+    """
+
+    def __init__(self, limit_mb, pid=None):
+        self.limit = limit_mb
+        self.fixed_pid = pid
+        self.pid = None
+        self.enabled = bool(limit_mb) and os.name == "nt"
+
+    def attach(self):
+        if not self.enabled:
+            return None
+        if self.fixed_pid:
+            self.pid = self.fixed_pid
+        else:
+            tabs = _figma_tabs()
+            self.pid = tabs[0][0] if tabs else None
+        return self.pid
+
+    def reading(self):
+        """Current MB of the watched tab, or None when it cannot be read."""
+        if not self.enabled or not self.pid:
+            return None
+        return _private_mb(self.pid)
+
+    def over(self):
+        mb = self.reading()
+        return mb if mb is not None and mb >= self.limit else None
+
+
+def _session_ids():
+    status, resp = _request("GET", "/sessions")
+    if status != 200:
+        return set()
+    return {r["sid"] for r in resp.get("sessions") or []}
+
+
+def _wait_for_reopen(old_sids, seconds):
+    """Wait for a plugin session that was not there before. True if one came.
+
+    A new session id is the only sign the file was really reopened: the old
+    tab keeps its session, and its memory, for as long as it stays open.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        new = _session_ids() - set(old_sids)
+        if new and _plugin_is_back():
+            return True
+        time.sleep(2.0)
+    return False
+
+
+def cmd_mem(args):
+    """Private memory of each Figma tab, largest first."""
+    if os.name != "nt":
+        print("figmosha: reading tab memory is Windows-only for now", file=sys.stderr)
+        return 1
+    tabs = _figma_tabs()
+    if not tabs:
+        print("no Figma renderer processes found — is Figma Desktop running?")
+        return 1
+    for i, (pid, mb) in enumerate(tabs):
+        mark = "  ← the heaviest tab; `each` watches this one" if i == 0 else ""
+        warn = "  ! over the guard's limit" if mb >= TAB_LIMIT_MB else ""
+        print(f"  pid {pid:<7} {mb:>6} MB{warn}{mark}")
+    print(f"  Figma closes a tab at about 2048 MB. `each` pauses at "
+          f"{TAB_LIMIT_MB} MB (--tab-limit).", file=sys.stderr)
+    return 0
+
+
 # ─── each: one script over a subtree, a unit at a time ─────────────────────
 
 def _children_of(node_id, timeout):
@@ -1986,10 +2135,15 @@ def _children_of(node_id, timeout):
     nothing, and discovering it after a 100-second overrun costs minutes of a
     blocked file — and sometimes the plugin.
     """
+    # Hidden layers inside an instance are left out: `h.walk` skips invisible
+    # instance children, and with that switched on Figma answers "does not
+    # exist" for them — a unit that can only fail, and says nothing when it does.
     code = (
         f"const n = {node_expr(node_id)};"
         f"if (!n) throw new Error('node not found: ' + {json.dumps(node_id)});"
-        f"return (n.children || []).map(c => ({{id: c.id, name: c.name, type: c.type}}));"
+        f"return (n.children || []).map(c => ({{id: c.id, name: c.name, type: c.type,"
+        f" hidden: c.visible === false && c.id.startsWith('I')}}))"
+        f".filter(c => !c.hidden).map(c => ({{id: c.id, name: c.name, type: c.type}}));"
     )
     status, resp = _exec(code, timeout, want_value=True)
     if resp.get("ok") is False:
@@ -1998,12 +2152,28 @@ def _children_of(node_id, timeout):
     return resp.get("value") or [], None
 
 
-def _split_ahead(root_id, levels, timeout):
+def _splittable(node, split_instances):
+    """Whether a node may be replaced by its children.
+
+    Not an instance, unless asked. Splitting one hands its sublayers to the
+    script and never the instance itself — and the instance is usually the very
+    thing a scan is looking for. Measured 2026-09-24: a `custom-control` placed
+    loose on a page was split into its three sublayers by `--split 2` and never
+    counted. A pruned walk of an instance is one node, so it never needs to be
+    split to fit.
+    """
+    return split_instances or node.get("type") != "INSTANCE"
+
+
+def _split_ahead(root_id, levels, timeout, split_instances=False):
     """Descend `levels` levels of children and return the leaves to run over."""
     frontier = [{"id": root_id, "name": root_id, "type": "ROOT"}]
     for _ in range(max(levels, 0)):
         nxt = []
         for node in frontier:
+            if not _splittable(node, split_instances):
+                nxt.append(node)
+                continue
             kids, err = _children_of(node["id"], timeout)
             if err is not None:
                 return None, err
@@ -2112,7 +2282,59 @@ def cmd_each(args):
             print(f"figmosha: {i} «{r.get('name', '?')}» was running when the previous "
                   f"attempt ended — running it again", file=sys.stderr)
 
-    units, err = _split_ahead(args.node_id, args.split, args.timeout)
+    def write(rec):
+        if state:
+            rec["t"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            state.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            state.flush()      # after every unit: the next one may be the crash
+
+    guard = TabGuard(args.tab_limit, args.tab_pid)
+    if guard.attach():
+        print(f"figmosha: watching Figma tab pid {guard.pid} "
+              f"({guard.reading()} MB now, pausing at {guard.limit} MB)", file=sys.stderr)
+    elif guard.enabled:
+        print("figmosha: no Figma tab process found — running without the memory guard",
+              file=sys.stderr)
+
+    def tab_allows(unit_id, name):
+        """False when the tab is past its limit and was not reopened in time.
+
+        Checked before a unit, not after the crash: past the limit the next page
+        or library component may be the one that takes the tab down, and the
+        unit running then is lost with it.
+        """
+        mb = guard.over()
+        if mb is None:
+            return True
+        write({"id": unit_id, "name": name, "status": "paused",
+               "reason": "tab-memory", "tab_mb": mb})
+        print(f"figmosha: the Figma tab is at {mb} MB (limit {guard.limit}) — "
+              f"pausing before {unit_id} «{name}».\n"
+              f"  Close the file, open it again on a light page (not in "
+              f"recovery mode), re-Run the plugin.", file=sys.stderr)
+        if not (args.reopen_wait and _wait_for_reopen(_session_ids(), args.reopen_wait)):
+            print("figmosha: not reopened — stopping; carry on with --resume",
+                  file=sys.stderr)
+            return False
+        guard.attach()
+        mb = guard.reading()
+        if mb is not None and mb >= guard.limit:
+            print(f"figmosha: the heaviest Figma tab is still at {mb} MB — another "
+                  f"heavy file open? Stopping; --tab-pid picks the tab by hand.",
+                  file=sys.stderr)
+            return False
+        print(f"figmosha: new session, tab pid {guard.pid} at {mb} MB — carrying on",
+              file=sys.stderr)
+        return True
+
+    # Splitting reads the file too — listing a page's children loads the page.
+    if not tab_allows(args.node_id, args.node_id):
+        if state:
+            state.close()
+        return EXIT_TAB_MEMORY
+
+    units, err = _split_ahead(args.node_id, args.split, args.timeout,
+                              split_instances=args.split_instances)
     if err is not None:
         if state:
             state.close()
@@ -2123,12 +2345,6 @@ def cmd_each(args):
     queue = [dict(u, depth=0) for u in units]
     tally = {"ok": 0, "failed": 0, "split": 0, "skipped": 0}
     outcome = 0
-
-    def write(rec):
-        if state:
-            rec["t"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            state.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            state.flush()      # after every unit: the next one may be the crash
 
     try:
         while queue:
@@ -2142,6 +2358,10 @@ def cmd_each(args):
                 kids = _kids_from_record(prev)
                 queue = [dict(k, depth=unit["depth"] + 1) for k in kids] + queue
                 continue
+
+            if not tab_allows(unit["id"], unit.get("name", "?")):
+                outcome = EXIT_TAB_MEMORY
+                break
 
             # Before running, not after: if this unit takes the tab down, the
             # state file is the only place its name survives.
@@ -2160,8 +2380,12 @@ def cmd_each(args):
             if rc == 0 and partial is None:
                 tally["ok"] += 1
                 print(f"  ok    {label}  {ms}ms", file=sys.stderr)
-                write({"id": unit["id"], "name": unit.get("name"),
-                       "status": "ok", "ms": ms, "value": resp.get("value")})
+                rec = {"id": unit["id"], "name": unit.get("name"),
+                       "status": "ok", "ms": ms, "value": resp.get("value")}
+                mb = guard.reading()
+                if mb is not None:
+                    rec["tab_mb"] = mb      # what the next calibration is made of
+                write(rec)
                 continue
 
             if rc == EXIT_BUSY or partial is not None:
@@ -2170,11 +2394,14 @@ def cmd_each(args):
                 # A script that stopped at its own deadline and said `partial`
                 # is the same unit, caught a moment earlier.
                 why = f"partial ({partial})" if partial is not None else "too slow"
-                if unit["depth"] >= args.max_split:
+                if unit["depth"] >= args.max_split or not _splittable(
+                        unit, args.split_instances):
                     tally["failed"] += 1
                     outcome = EXIT_BUSY
-                    print(f"  FAIL  {label}  {why}, and already split "
-                          f"{unit['depth']} time(s)", file=sys.stderr)
+                    tail = (f"and already split {unit['depth']} time(s)"
+                            if _splittable(unit, args.split_instances)
+                            else "and it is an instance (--split-instances to go inside)")
+                    print(f"  FAIL  {label}  {why}, {tail}", file=sys.stderr)
                     write({"id": unit["id"], "name": unit.get("name"),
                            "status": "partial" if partial is not None else "failed",
                            "ms": ms, "error": resp.get("error") or why,
@@ -2209,7 +2436,8 @@ def cmd_each(args):
                 print(f"  split {label}  {why} → {len(kids)} child(ren)", file=sys.stderr)
                 write({"id": unit["id"], "name": unit.get("name"),
                        "status": "split", "ms": ms, "why": why,
-                       "into": [{"id": k["id"], "name": k.get("name")} for k in kids]})
+                       "into": [{"id": k["id"], "name": k.get("name"),
+                                 "type": k.get("type")} for k in kids]})
                 # Depth-first: finish this branch before moving on, so a run
                 # that is interrupted has whole subtrees done rather than a
                 # scattering of pieces.
@@ -2304,6 +2532,7 @@ def build_parser():
                              "only for a project whose exec scripts still use the "
                              "synchronous APIs; see CLAUDE.md → Dynamic pages")
 
+    sub.add_parser("mem", help="private memory of each Figma tab (Windows)")
     p_status = sub.add_parser("status")
     p_status.add_argument("--raw", action="store_true", help="print full JSON response")
     p_sessions = sub.add_parser(
@@ -2445,6 +2674,20 @@ def build_parser():
     p_each.add_argument("--partial-is-ok", action="store_true",
                         help="record a unit whose result says partial: true as done. "
                              "By default it is split and run again smaller, like a timeout")
+    p_each.add_argument("--tab-limit", type=int, default=TAB_LIMIT_MB, metavar="MB",
+                        help=f"pause before a unit once the Figma tab's private memory "
+                             f"reaches this (default {TAB_LIMIT_MB}; Figma closes the tab "
+                             f"at about 2048). 0 turns the guard off. Windows only")
+    p_each.add_argument("--tab-pid", type=int, metavar="PID",
+                        help="the Figma renderer to watch, when the heaviest one is not "
+                             "the file being scanned (see `figmosha mem`)")
+    p_each.add_argument("--reopen-wait", type=int, default=1800, metavar="S",
+                        help="after a pause, wait this long for the file to be reopened "
+                             "and carry on by itself (default 1800; 0 = stop at once, "
+                             "exit code 5)")
+    p_each.add_argument("--split-instances", action="store_true",
+                        help="let splitting go inside instances. Off by default: a split "
+                             "instance hands its sublayers to the script and never itself")
     p_each.add_argument("--max-split", type=int, default=4, metavar="N",
                         help="how many times a unit may be split before it is called "
                              "failed (default 4)")
@@ -2500,6 +2743,7 @@ def main():
         "update": cmd_update,
         "status": cmd_status,
         "sessions": cmd_sessions,
+        "mem": cmd_mem,
         "doctor": cmd_doctor,
         "sel": cmd_sel,
         "props": cmd_props,

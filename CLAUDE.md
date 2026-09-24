@@ -1,4 +1,4 @@
-# Figmosha 3.0 — Claude Code instructions
+# Figmosha 3.2 — Claude Code instructions
 
 Drive Figma by sending JS through a local bridge connected to a plugin running
 inside Figma Desktop.
@@ -43,7 +43,8 @@ on its first line. Two spellings remove the guess:
 
 Exit codes, so a runner need not read prose: **0** ok · **1** the script threw ·
 **2** bad arguments · **3** no plugin (`--wait-plugin N` waits for it) ·
-**4** timed out or the file is busy.
+**4** timed out or the file is busy · **5** `each` paused before the Figma tab
+ran out of memory (reopen the file, `--resume`).
 
 Output is deliberately compact: one line per node, sizes rounded, results
 capped at 64 KB and logs at 200 lines with an explicit truncation marker. Add
@@ -108,7 +109,8 @@ Rules that follow from how Figma works, not from Figmosha:
 | `figmosha tree <id> [--depth N] [--layout]` | Explore structure. **Depth 3 by default**; a cut branch says `… +N deeper`, and three or more identical siblings collapse into one row (`--no-collapse` to see them all) |
 | `figmosha find <id> name=Button` | Locate by exact name (`name~Btn` = substring) |
 | `figmosha find <id> type=INSTANCE` | Filter by type (also `text=`, `text~`). Prints 100 rows, then says how many were left (`--limit N`). **Does not descend into instances** — `--nested` does; `--count` skips building the list |
-| `figmosha each <id> -f s.js --split 2 --state run.jsonl` | Run one script over a subtree, a unit at a time, writing state as it goes. `--resume` continues an interrupted run. A result that says `partial: true` is split and run smaller, like a timeout. This is how a big file is scanned |
+| `figmosha each <id> -f s.js --split 2 --state run.jsonl` | Run one script over a subtree, a unit at a time, writing state as it goes. `--resume` continues an interrupted run. A result that says `partial: true` is split and run smaller, like a timeout. Instances are never split (`--split-instances` to go inside). Pauses before a unit once the Figma tab passes `--tab-limit` MB and carries on when the file is reopened. This is how a big file is scanned |
+| `figmosha mem` | Private memory of each Figma tab, largest first — the number the tab dies of (Windows) |
 | `figmosha sessions [--reset SID]` | Which files are connected and which are `BUSY`. `--reset` only makes the bridge forget — it cannot stop a running script |
 | `figmosha set <id> gap=16 fill=#f5f5f5` | Change literal values — the alternative to a hand-written exec |
 | `figmosha bind <id> gap=space/md fill=surface/bg` | Bind the same keys to variables **by token name** |
@@ -314,6 +316,22 @@ budget of one tab is counted in **heavy pages and distinct component keys**, not
 in requests, and a heavy file is several tab sessions: one heavy page per
 session, reopened on a light page in between, `each --resume` across them.
 Filter on something cheap before `h.mainOf` (`variantProperties` costs ms).
+
+**`each` watches the tab from outside.** The plugin cannot see the memory it
+is filling; the tab's renderer process can be read from the CLI, so before
+every unit — and before splitting, since listing a page's children loads the
+page — `each` reads its private bytes. Past `--tab-limit` (default 1700 MB; the
+tab dies near 2 GB) it writes `paused`, says to reopen the file, and waits up
+to `--reopen-wait` seconds for a *new* plugin session, then carries on by
+itself. Not reopened in time: exit code 5, `--resume` later. `figmosha mem`
+shows the numbers. The watched tab is the heaviest renderer, which is the file
+being scanned whenever it matters; `--tab-pid` otherwise. Windows only for now.
+
+**`each` does not split instances.** A split hands a node's children to the
+script and never the node itself, so a split instance is an instance nobody
+looked at — measured 2026-09-24, a `custom-control` on a page went uncounted
+that way. A pruned walk of an instance is one node and never needs splitting.
+`--split-instances` when the sublayers are the point.
 
 **`h.walk` over `findAll`.** `findAll` is synchronous, materialises every match
 as a live node proxy and descends into instances. `h.walk` prunes, checks the

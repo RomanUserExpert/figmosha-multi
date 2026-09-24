@@ -21,6 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import figmosha  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_real_figma_tabs(monkeypatch):
+    """`each` reads the Figma tab's memory from outside. Not this machine's, here."""
+    monkeypatch.setattr(figmosha, "_figma_tabs", lambda: [])
+
+
 def parse(*argv):
     return figmosha.build_parser().parse_args(figmosha.normalize_argv(list(argv)))
 
@@ -1281,6 +1287,162 @@ def test_each_partial_is_ok_keeps_the_old_behaviour(monkeypatch, tmp_path):
     rc = figmosha.cmd_each(_each_args(tmp_path, partial_is_ok=True))
     assert rc == 0
     assert len([c for c in seen if CHILDREN not in c]) == 1
+
+
+def test_each_does_not_split_an_instance_into_its_sublayers(monkeypatch, tmp_path):
+    """Split, an instance hands its sublayers to the script and never itself.
+
+    2026-09-24: a `custom-control` placed loose on a page became three units
+    (`head-card-cardcontrol`, `content-box`, `button-group`) and was not counted.
+    """
+    listed = []
+
+    def handler(code):
+        if CHILDREN in code:
+            listed.append(code)
+            if '"page"' in code:
+                return 200, {"ok": True, "value": [
+                    {"id": "1:1", "name": "custom-control", "type": "INSTANCE"},
+                    {"id": "1:2", "name": "Screen", "type": "FRAME"}]}
+            return 200, {"ok": True, "value": [
+                {"id": "2:1", "name": "Section", "type": "FRAME"}]}
+        return 200, {"ok": True, "value": "done"}
+
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path, split=2))
+    assert rc == 0
+    ran = [c for c in seen if CHILDREN not in c]
+    assert any('const ROOT_ID = "1:1";' in c for c in ran), "the instance is a unit"
+    assert any('const ROOT_ID = "2:1";' in c for c in ran), "the frame was split"
+    assert not any('"1:1"' in c for c in listed), "its children were never listed"
+
+
+def test_each_split_instances_goes_inside_when_asked(monkeypatch, tmp_path):
+    def handler(code):
+        if CHILDREN in code:
+            if '"page"' in code:
+                return 200, {"ok": True, "value": [
+                    {"id": "1:1", "name": "card", "type": "INSTANCE"}]}
+            return 200, {"ok": True, "value": [
+                {"id": "I1:1;5:5", "name": "content", "type": "FRAME"}]}
+        return 200, {"ok": True, "value": "done"}
+
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path, split=2, split_instances=True))
+    assert rc == 0
+    ran = [c for c in seen if CHILDREN not in c]
+    assert len(ran) == 1 and 'const ROOT_ID = "I1:1;5:5";' in ran[0]
+
+
+def test_each_does_not_split_an_instance_that_overruns(monkeypatch, tmp_path, capsys):
+    """Going inside would lose the instance; it fails with a way to opt in."""
+    def handler(code):
+        if CHILDREN in code:
+            return 200, {"ok": True, "value": [
+                {"id": "1:1", "name": "card", "type": "INSTANCE"}]}
+        return 504, {"ok": False, "error": "timeout after 60s", "busy": True}
+
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path))
+    assert rc == figmosha.EXIT_BUSY
+    assert len([c for c in seen if CHILDREN in c]) == 1, "never listed to split"
+    assert "--split-instances" in capsys.readouterr().err
+
+
+def test_children_listing_leaves_out_hidden_instance_sublayers():
+    """With invisible instance children skipped, Figma says they do not exist."""
+    seen = []
+
+    def fake_exec(code, timeout=60, want_value=False):
+        seen.append(code)
+        return 200, {"ok": True, "value": []}
+
+    orig = figmosha._exec
+    figmosha._exec = fake_exec
+    try:
+        figmosha._children_of("1:1", 10)
+    finally:
+        figmosha._exec = orig
+    assert "c.visible === false && c.id.startsWith('I')" in seen[0]
+
+
+def _tab(monkeypatch, readings):
+    """A Figma tab whose private memory reads `readings` in turn, then the last."""
+    it = iter(readings)
+    last = [readings[0]]
+
+    def read(pid):
+        last[0] = next(it, last[0])
+        return last[0]
+
+    monkeypatch.setattr(figmosha, "_figma_tabs", lambda: [(4242, readings[0])])
+    monkeypatch.setattr(figmosha, "_private_mb", read)
+    monkeypatch.setattr(figmosha.os, "name", "nt")
+
+
+def _two_frames(code):
+    if CHILDREN in code:
+        return 200, {"ok": True, "value": [
+            {"id": "1:1", "name": "A", "type": "FRAME"},
+            {"id": "1:2", "name": "B", "type": "FRAME"}]}
+    return 200, {"ok": True, "value": "done"}
+
+
+def test_each_pauses_before_a_unit_once_the_tab_is_over_its_limit(
+        monkeypatch, tmp_path, capsys):
+    """Past the limit the next unit may be the one that takes the tab down."""
+    # attach, before splitting, before 1:1, after 1:1, before 1:2
+    _tab(monkeypatch, [900, 1000, 1000, 1750, 1750])
+    monkeypatch.setattr(figmosha, "_session_ids", lambda: {"s-old"})
+    seen = _fake_bridge(monkeypatch, _two_frames)
+    state = tmp_path / "run.jsonl"
+    rc = figmosha.cmd_each(_each_args(tmp_path, state=str(state), reopen_wait=0))
+    assert rc == figmosha.EXIT_TAB_MEMORY
+    ran = [c for c in seen if CHILDREN not in c]
+    assert len(ran) == 1 and 'const ROOT_ID = "1:1";' in ran[0]
+    rows = [json.loads(l) for l in state.read_text(encoding="utf-8").splitlines()]
+    assert rows[1]["tab_mb"] == 1750, "the reading goes into the state"
+    assert rows[-1] == dict(rows[-1], id="1:2", status="paused", reason="tab-memory")
+    assert "open it again on a light page" in capsys.readouterr().err
+    # and the paused unit is not done: a resume runs it
+    assert figmosha._load_state(str(state))["1:2"]["status"] != "ok"
+
+
+def test_each_carries_on_by_itself_once_the_file_is_reopened(monkeypatch, tmp_path):
+    _tab(monkeypatch, [900, 1000, 1000, 1750, 1750, 950, 960])
+    monkeypatch.setattr(figmosha, "_session_ids", lambda: {"s-old"})
+    monkeypatch.setattr(figmosha, "_wait_for_reopen", lambda old, s: True)
+    seen = _fake_bridge(monkeypatch, _two_frames)
+    rc = figmosha.cmd_each(_each_args(tmp_path))
+    assert rc == 0
+    assert len([c for c in seen if CHILDREN not in c]) == 2
+
+
+def test_each_does_not_even_split_when_the_tab_is_already_over(monkeypatch, tmp_path):
+    """Listing a page's children loads the page — the step that tips a full tab."""
+    _tab(monkeypatch, [1900])
+    monkeypatch.setattr(figmosha, "_session_ids", lambda: {"s-old"})
+    seen = _fake_bridge(monkeypatch, _two_frames)
+    rc = figmosha.cmd_each(_each_args(tmp_path, reopen_wait=0))
+    assert rc == figmosha.EXIT_TAB_MEMORY
+    assert seen == [], "nothing was sent to the tab"
+
+
+def test_each_tab_limit_zero_turns_the_guard_off(monkeypatch, tmp_path):
+    _tab(monkeypatch, [3000])
+    seen = _fake_bridge(monkeypatch, _two_frames)
+    rc = figmosha.cmd_each(_each_args(tmp_path, tab_limit=0))
+    assert rc == 0
+    assert len([c for c in seen if CHILDREN not in c]) == 2
+
+
+def test_wait_for_reopen_wants_a_session_that_was_not_there(monkeypatch):
+    """The old tab keeps its session, and its memory, while it stays open."""
+    answers = iter([{"s-old"}, {"s-old", "s-new"}])
+    monkeypatch.setattr(figmosha, "_session_ids", lambda: next(answers))
+    monkeypatch.setattr(figmosha, "_plugin_is_back", lambda: True)
+    monkeypatch.setattr(figmosha.time, "sleep", lambda s: None)
+    assert figmosha._wait_for_reopen({"s-old"}, 60) is True
 
 
 def test_load_state_takes_the_last_record_per_id(tmp_path):

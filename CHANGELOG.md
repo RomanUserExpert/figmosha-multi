@@ -9,6 +9,32 @@ code it started with, so new helpers won't exist until you do. If
 `plugin/manifest.json` changed, re-*import* it rather than just re-running, and
 re-run `figmosha init` so the copy's project identity survives the update.
 
+## [3.2.0] — 2026-09-24
+
+The rest of the memory story, from the same file: the tab still dies near 2 GB,
+and now `each` sees that coming.
+
+- **`each` pauses before the Figma tab runs out of memory.** Before every unit,
+  and before splitting, it reads the private bytes of the tab's renderer
+  process (Windows). Past `--tab-limit` (default 1700 MB) it writes a `paused`
+  record, tells you to reopen the file on a light page, and waits up to
+  `--reopen-wait` seconds (default 1800) for a new plugin session — then
+  carries on by itself. Not reopened: exit code **5**, `--resume` later. Every
+  `ok` record carries `tab_mb`, which is what the next calibration is made of.
+  `--tab-pid` picks the tab by hand; `--tab-limit 0` turns the guard off.
+  Live check: on a tab at 1974 MB, `each` sent nothing to Figma and exited 5.
+  Before that, the same tab answered a plain child listing with Figma's own
+  "Unable to establish connection to Figma".
+- **`figmosha mem`** — private memory of each Figma tab, largest first.
+- **`each` no longer splits instances.** Splitting one handed its sublayers to
+  the script and never the instance itself: a `custom-control` placed loose on
+  a page became three units and was not counted. Instances are units of their
+  own now; one that overruns fails with a pointer to `--split-instances`, which
+  restores the old behaviour.
+- **Hidden layers inside instances are no longer listed as units.** With
+  invisible instance children skipped (3.1), Figma answers "does not exist" for
+  them, so they could only ever fail.
+
 ## [3.1.0] — 2026-09-24
 
 3.0 fixed the thread and the resume. It did not fix the memory: on the same

@@ -24,7 +24,7 @@ CONFIG = ROOT / "project.json"
 # Reported by the bridge in GET / and printed by --version. One number for the
 # whole copy, so a client can tell an old bridge from a new one — the handshake
 # is the only place where that is visible at all.
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 # 8787 stays with the zero copy, so project ports start above it. 100 slots is
 # far more projects than anyone runs, and keeps the numbers short to read.

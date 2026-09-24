@@ -1,4 +1,4 @@
-# Figmosha 3.0
+# Figmosha 3.2
 
 Drive Figma from your terminal / Claude Code / any HTTP client. A tiny custom plugin sits inside Figma Desktop and holds a WebSocket to a local Python server — you send Figma Plugin API code over HTTP and get the result back.
 
@@ -317,6 +317,7 @@ python figmosha.py rm sel                        # delete everything selected
 python figmosha.py find 1:23 type=TEXT --raw     # same query, the whole walk as JSON
 python figmosha.py find 1:23 type=INSTANCE --nested   # look inside instances too (off by default)
 python figmosha.py each 1:23 -f scan.js --split 2 --state run.jsonl --resume
+python figmosha.py mem                           # Figma tabs by private memory (Windows)
 python figmosha.py icomp <component-key>         # import library component, place + zoom
 python figmosha.py status                        # bridge + plugin connection state
 python figmosha.py update                        # pull + re-stamp this copy's plugin identity
