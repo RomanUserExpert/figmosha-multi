@@ -9,6 +9,32 @@ code it started with, so new helpers won't exist until you do. If
 `plugin/manifest.json` changed, re-*import* it rather than just re-running, and
 re-run `figmosha init` so the copy's project identity survives the update.
 
+## [3.1.0] — 2026-09-24
+
+3.0 fixed the thread and the resume. It did not fix the memory: on the same
+file the tab still ran out, three times, with only a few hundred `mainOf` calls
+(see [`figmosha-problems/memory-ceiling-2026-09-24.md`](figmosha-problems/memory-ceiling-2026-09-24.md)).
+Measured afterwards in the tab's own process: a heavy page costs hundreds of
+MB to load, a new library component tens, a section of an already loaded page
+a few — and nothing is released until the file is reopened. The plan is in
+[`figmosha-problems/MEMORY-FIX-PLAN.md`](figmosha-problems/MEMORY-FIX-PLAN.md);
+this release is its first step.
+
+- **`h.walk` skips hidden layers inside instances.** It turns on
+  `figma.skipInvisibleInstanceChildren` for the walk and restores it after. A
+  cold section of a table-heavy page went from 3.1–3.7 s to 0.2–0.7 s.
+  `skipInvisible: false` opts out; `find --hidden` does the same for `find`.
+- **`each` no longer records a `partial: true` result as done.** It is split
+  and run smaller, the same as a timeout. `--partial-is-ok` keeps the old
+  behaviour for scripts where `partial` means something else.
+- **`each` writes `started` before every unit**, and `--resume` reads the
+  **last record per id**: a unit it already split is not run again (its
+  children are), and one that was running when the tab died is named.
+- **`figmosha sessions` says `STALLED`** for a request the plugin never
+  started — a frozen or out-of-memory tab — instead of `BUSY 0s`.
+
+Re-Run the plugin after updating; the manifest did not change.
+
 ## [3.0.1] — 2026-09-21
 
 `update` told you two different things in a row. `init`, which it calls, can

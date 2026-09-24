@@ -488,105 +488,28 @@ const HELPERS = {
   //                   thread cannot be interrupted from outside, so both are
   //                   checked inside the loop.
   //   maxNodes        the same ceiling counted in nodes rather than ms.
+  //   skipInvisible   while walking, figma.skipInvisibleInstanceChildren is on:
+  //                   Figma does not build the hidden layers of an instance the
+  //                   walk meets. Measured on 2026-09-24 on table-heavy screens:
+  //                   a cold section took 3.1–3.7 s without it, 0.2–0.7 s with
+  //                   it — the hidden rows and states were the cost, not the
+  //                   walk. Pass false when hidden layers inside instances are
+  //                   what you are looking for.
   //
   // Out of budget it returns {partial: true, cursor}. Pass that cursor back to
   // carry on from where it stopped — which is what makes a long scan resumable
   // instead of restartable.
   async walk(root, visit, opts) {
     opts = opts || {};
-    const prune = opts.pruneInstances !== false;
-    const maxNodes = opts.maxNodes == null ? 500000 : opts.maxNodes;
-    const maxDepth = opts.maxDepth == null ? Infinity : opts.maxDepth;
-    const maxHits = opts.maxHits == null ? 100000 : opts.maxHits;
-    // `find` means "descendants of", the way findAll always did; a walk that
-    // reported its own starting node would quietly change every count.
-    const includeRoot = opts.includeRoot !== false;
-    // Whichever runs out first: this walk's own budget, or the caller's.
-    const until = opts.budgetMs == null ? 0 : Date.now() + opts.budgetMs;
-    const spent = () => (until && Date.now() >= until) || h_left() <= 0;
-    const out = [];
-
-    // Children we are willing to descend into. Pruning the root would make
-    // walking an instance pointless, so it only applies below it.
-    const kidsOf = (n, depth) => {
-      if (depth >= maxDepth) return null;
-      if (prune && depth > 0 && n.type === "INSTANCE") return null;
-      return n.children && n.children.length ? n.children : null;
-    };
-
-    // A frame is "this node, and which of its children comes next" — the state
-    // a recursive walk keeps on the call stack, made explicit so it can be
-    // paused, handed out as a cursor and picked up again.
-    const frames = [];
-    let visited = 0;
-    let pruned = 0;
-    let resumed = false;
-
-    if (opts.cursor && opts.cursor.length) {
-      resumed = true;
-      let node = root;
-      frames.push({ node, i: opts.cursor[0], depth: 0 });
-      for (let d = 1; d < opts.cursor.length; d++) {
-        const kids = kidsOf(node, d - 1);
-        // i is one past the child we descended into, so that child is at i-1.
-        const child = kids && kids[opts.cursor[d - 1] - 1];
-        if (!child) break;
-        frames.push({ node: child, i: opts.cursor[d], depth: d });
-        node = child;
-      }
-    } else {
-      frames.push({ node: root, i: 0, depth: 0 });
+    if (opts.skipInvisible === false) return walkSubtree(root, visit, opts);
+    // Restored rather than reset: a script that set the flag itself keeps it.
+    const before = figma.skipInvisibleInstanceChildren;
+    figma.skipInvisibleInstanceChildren = true;
+    try {
+      return await walkSubtree(root, visit, opts);
+    } finally {
+      figma.skipInvisibleInstanceChildren = before;
     }
-
-    const cursor = () => frames.map((f) => f.i);
-    const record = async (n) => {
-      const r = visit(n);
-      const value = r && typeof r.then === "function" ? await r : r;
-      if (value !== undefined && value !== null && value !== false) out.push(value);
-    };
-
-    if (!resumed && includeRoot) await record(root);
-
-    while (frames.length) {
-      // Every node, not every Nth. A stride only looks like a saving: measured
-      // inside Figma, Date.now() costs 0.19 µs while reading one node's `type`
-      // and `children` costs 17.63 µs — 95 times more — so checking always adds
-      // about 1% to the walk. A stride of 256, meanwhile, multiplies the
-      // overshoot by whatever the visit costs, and the visit is the expensive
-      // part: at 10 ms a node it walked 2.5 s past the deadline and the partial
-      // result arrived after its caller had already gone.
-      //
-      // One slow visit can still overshoot by its own duration; that is what
-      // the margin on DEADLINE absorbs.
-      if (spent()) {
-        return { visited, pruned, found: out, partial: true, cursor: cursor(),
-                 reason: "deadline" };
-      }
-      if (visited >= maxNodes) {
-        return { visited, pruned, found: out, partial: true, cursor: cursor(),
-                 reason: "maxNodes" };
-      }
-      if (out.length >= maxHits) {
-        return { visited, pruned, found: out, partial: true, cursor: cursor(),
-                 reason: "maxHits" };
-      }
-
-      const f = frames[frames.length - 1];
-      const kids = kidsOf(f.node, f.depth);
-      if (!kids || f.i >= kids.length) { frames.pop(); continue; }
-
-      const child = kids[f.i++];
-      visited++;
-      // Counted, not just skipped: a result that silently left out half the
-      // file is worse than a slow one, so the caller is told when pruning
-      // actually happened and can pass pruneInstances: false if it mattered.
-      if (prune && child.type === "INSTANCE" && child.children && child.children.length) {
-        pruned++;
-      }
-      await record(child);
-      frames.push({ node: child, i: 0, depth: f.depth + 1 });
-    }
-    return { visited, pruned, found: out, partial: false, cursor: null, reason: null };
   },
 
   // First descendant by exact name
@@ -885,6 +808,104 @@ const HELPERS = {
     };
   },
 };
+
+// The body of h.walk, outside HELPERS so the flag h.walk sets around it is
+// set and restored in exactly one place.
+async function walkSubtree(root, visit, opts) {
+  const prune = opts.pruneInstances !== false;
+  const maxNodes = opts.maxNodes == null ? 500000 : opts.maxNodes;
+  const maxDepth = opts.maxDepth == null ? Infinity : opts.maxDepth;
+  const maxHits = opts.maxHits == null ? 100000 : opts.maxHits;
+  // `find` means "descendants of", the way findAll always did; a walk that
+  // reported its own starting node would quietly change every count.
+  const includeRoot = opts.includeRoot !== false;
+  // Whichever runs out first: this walk's own budget, or the caller's.
+  const until = opts.budgetMs == null ? 0 : Date.now() + opts.budgetMs;
+  const spent = () => (until && Date.now() >= until) || h_left() <= 0;
+  const out = [];
+
+  // Children we are willing to descend into. Pruning the root would make
+  // walking an instance pointless, so it only applies below it.
+  const kidsOf = (n, depth) => {
+    if (depth >= maxDepth) return null;
+    if (prune && depth > 0 && n.type === "INSTANCE") return null;
+    return n.children && n.children.length ? n.children : null;
+  };
+
+  // A frame is "this node, and which of its children comes next" — the state
+  // a recursive walk keeps on the call stack, made explicit so it can be
+  // paused, handed out as a cursor and picked up again.
+  const frames = [];
+  let visited = 0;
+  let pruned = 0;
+  let resumed = false;
+
+  if (opts.cursor && opts.cursor.length) {
+    resumed = true;
+    let node = root;
+    frames.push({ node, i: opts.cursor[0], depth: 0 });
+    for (let d = 1; d < opts.cursor.length; d++) {
+      const kids = kidsOf(node, d - 1);
+      // i is one past the child we descended into, so that child is at i-1.
+      const child = kids && kids[opts.cursor[d - 1] - 1];
+      if (!child) break;
+      frames.push({ node: child, i: opts.cursor[d], depth: d });
+      node = child;
+    }
+  } else {
+    frames.push({ node: root, i: 0, depth: 0 });
+  }
+
+  const cursor = () => frames.map((f) => f.i);
+  const record = async (n) => {
+    const r = visit(n);
+    const value = r && typeof r.then === "function" ? await r : r;
+    if (value !== undefined && value !== null && value !== false) out.push(value);
+  };
+
+  if (!resumed && includeRoot) await record(root);
+
+  while (frames.length) {
+    // Every node, not every Nth. A stride only looks like a saving: measured
+    // inside Figma, Date.now() costs 0.19 µs while reading one node's `type`
+    // and `children` costs 17.63 µs — 95 times more — so checking always adds
+    // about 1% to the walk. A stride of 256, meanwhile, multiplies the
+    // overshoot by whatever the visit costs, and the visit is the expensive
+    // part: at 10 ms a node it walked 2.5 s past the deadline and the partial
+    // result arrived after its caller had already gone.
+    //
+    // One slow visit can still overshoot by its own duration; that is what
+    // the margin on DEADLINE absorbs.
+    if (spent()) {
+      return { visited, pruned, found: out, partial: true, cursor: cursor(),
+               reason: "deadline" };
+    }
+    if (visited >= maxNodes) {
+      return { visited, pruned, found: out, partial: true, cursor: cursor(),
+               reason: "maxNodes" };
+    }
+    if (out.length >= maxHits) {
+      return { visited, pruned, found: out, partial: true, cursor: cursor(),
+               reason: "maxHits" };
+    }
+
+    const f = frames[frames.length - 1];
+    const kids = kidsOf(f.node, f.depth);
+    if (!kids || f.i >= kids.length) { frames.pop(); continue; }
+
+    const child = kids[f.i++];
+    visited++;
+    // Counted, not just skipped: a result that silently left out half the
+    // file is worse than a slow one, so the caller is told when pruning
+    // actually happened and can pass pruneInstances: false if it mattered.
+    if (prune && child.type === "INSTANCE" && child.children && child.children.length) {
+      pruned++;
+    }
+    await record(child);
+    frames.push({ node: child, i: 0, depth: f.depth + 1 });
+  }
+  return { visited, pruned, found: out, partial: false, cursor: null, reason: null };
+}
 
 // h.left() by another name, so helpers can ask without going through the
 // object literal they are being defined inside.

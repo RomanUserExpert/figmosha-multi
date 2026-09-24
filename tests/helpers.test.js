@@ -328,6 +328,21 @@ async function throws(fn) {
   check("maxDepth applies to the walk too",
         deepWalk.found, ["w:0", "w:1", "w:4", "w:7"]);
 
+  // Hidden layers inside an instance were most of what a cold walk cost on a
+  // table-heavy file, so the walk asks Figma not to build them — and puts the
+  // flag back afterwards, whatever the script had it set to.
+  figma.skipInvisibleInstanceChildren = false;
+  const during = await h.walk(tree, () => figma.skipInvisibleInstanceChildren, { maxDepth: 0 });
+  check("walk skips invisible instance children while it runs", during.found, [true]);
+  check("…and restores the flag afterwards", figma.skipInvisibleInstanceChildren, false);
+  const shown = await h.walk(tree, () => String(figma.skipInvisibleInstanceChildren),
+                             { maxDepth: 0, skipInvisible: false });
+  check("skipInvisible: false leaves hidden layers visible", shown.found, ["false"]);
+  figma.skipInvisibleInstanceChildren = true;
+  await h.walk(tree, () => undefined);
+  check("a flag the script set itself is kept", figma.skipInvisibleInstanceChildren, true);
+  figma.skipInvisibleInstanceChildren = false;
+
   // An async visit is the normal case — h.mainOf is one — so it must be awaited
   // rather than collected as a pile of pending promises.
   const asyncSeen = await h.walk(tree, async (n) => n.name, { maxDepth: 1 });

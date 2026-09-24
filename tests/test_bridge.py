@@ -845,6 +845,24 @@ def test_a_caller_waits_out_a_busy_plugin_within_its_own_timeout():
     run(go())
 
 
+def test_a_request_never_started_is_stalled(monkeypatch):
+    """A plugin that says `started` and then does not is frozen, not slow."""
+    monkeypatch.setattr(bridge, "STALL_S", 0.5)
+
+    async def go():
+        c = await make_client()
+        async with HeldPlugin(c, sid="s1", file="One"):
+            r = await c.post("/exec", json={"code": "slow", "timeout": 1})
+            assert r.status == 504
+            session = bridge.SESSIONS["s1"]
+            assert session.describe()["stalled"] is False, \
+                "a plugin that never says `started` must not look stalled"
+            session.sends_started = True
+            assert session.describe()["stalled"] is True
+        await c.close()
+    run(go())
+
+
 def test_started_makes_ran_ms_honest():
     """Dispatched is not running: without `started` the two are indistinguishable."""
     async def go():

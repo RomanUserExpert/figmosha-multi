@@ -16,6 +16,7 @@ Commands:
     figmosha tree <id> [--depth N] [--layout]
     figmosha find <id> <filter>       # find descendants (name=X, name~X, type=X, text=X)
                                       #   instances are not descended into; --nested does
+                                      #   hidden layers inside them are skipped; --hidden
     figmosha text <id> "<new text>"   # set TEXT node characters (autoloads font)
     figmosha variant <id> "P=V" ...   # set INSTANCE variant property values
     figmosha clone <id> [--right|--left|--up|--down] [--gap N] [--name N]
@@ -1603,7 +1604,10 @@ def cmd_sessions(args):
     for row in rows:
         marker = "*" if matched is not None and row["sid"] in matched else " "
         state = "idle"
-        if row.get("busy"):
+        if row.get("stalled"):
+            state = (f"STALLED {int(row.get('running_ms', 0) / 1000)}s "
+                     f"(dispatched, never started)")
+        elif row.get("busy"):
             state = f"BUSY {int(row.get('running_ms', 0) / 1000)}s"
             if row.get("orphaned"):
                 state += " (its caller gave up)"
@@ -1612,7 +1616,12 @@ def cmd_sessions(args):
         print(f"{marker} «{row.get('file') or '?'}»  {row['sid']}"
               f"  page «{row.get('page') or '?'}»  {state}"
               f"  pending {row.get('pending', 0)}  {row.get('age_s', 0)}s")
-    if any(r.get("busy") for r in rows):
+    if any(r.get("stalled") for r in rows):
+        print("  STALLED means the plugin never picked the request up: the tab is frozen "
+              "or out of memory.\n  `figmosha exec \"return 1\" -t 15` is the test. If "
+              "that fails too, reopen the file\n  (normally, on a light page), re-Run the "
+              "plugin, and carry on with `each --resume`.", file=sys.stderr)
+    elif any(r.get("busy") for r in rows):
         print("  BUSY means a script still owns that file's JS thread. Figma cannot "
               "interrupt it;\n  it usually returns on its own. `figmosha sessions "
               "--reset <sid>` only clears the\n  bridge's memory of it — the script "
@@ -1787,7 +1796,10 @@ def cmd_find(args):
     # there by default, checks the caller's deadline between nodes, and hands
     # back rows rather than proxies.
     prune = "false" if args.nested else "true"
-    opts = f"{{pruneInstances: {prune}, includeRoot: false}}"
+    # Hidden layers inside instances are not built unless asked for: on a
+    # table-heavy file they were most of what a cold walk cost.
+    skip = "false" if args.hidden else "true"
+    opts = f"{{pruneInstances: {prune}, skipInvisible: {skip}, includeRoot: false}}"
     preamble = (
         f"const root = {node_expr(args.node_id)};"
         f"if (!root) throw new Error('node not found: ' + {json.dumps(args.node_id)});"
@@ -2002,8 +2014,14 @@ def _split_ahead(root_id, levels, timeout):
 
 
 def _load_state(path):
-    """Ids this run already finished, from a previous attempt's state file."""
-    done = {}
+    """The last record per id, from a previous attempt's state file.
+
+    The last one, not any one: after a crash and a resume the same unit is in
+    the file as `started`, then `failed`, then `ok`, and only the last line says
+    where it stands. A reader that stopped at the first `failed` once declared
+    a finished page broken.
+    """
+    last = {}
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -2014,11 +2032,36 @@ def _load_state(path):
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("status") == "ok":
-                    done[rec.get("id")] = rec
+                if rec.get("id") is not None:
+                    last[rec["id"]] = rec
     except FileNotFoundError:
         pass
-    return done
+    return last
+
+
+def _partial_of(value):
+    """The script's own `partial` verdict, if its result carries one.
+
+    A scan that stops at its own deadline still returns normally, so the exit
+    code says `ok` about a unit that is half done. The result usually arrives
+    as JSON text, and a script that returned JSON.stringify(...) is text twice.
+    """
+    for _ in range(2):
+        if not isinstance(value, str):
+            break
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    if isinstance(value, dict) and value.get("partial") is True:
+        return value.get("reason") or "partial"
+    return None
+
+
+def _kids_from_record(rec):
+    """Children a previous attempt split a unit into, as queue entries."""
+    return [k if isinstance(k, dict) else {"id": k, "name": k}
+            for k in rec.get("into") or []]
 
 
 def cmd_each(args):
@@ -2057,9 +2100,17 @@ def cmd_each(args):
         WAIT_PLUGIN = 300
 
     state = open(args.state, "a", encoding="utf-8") if args.state else None
-    done = _load_state(args.state) if (args.state and args.resume) else {}
-    if done:
+    last = _load_state(args.state) if (args.state and args.resume) else {}
+    done = {i for i, r in last.items() if r.get("status") == "ok"}
+    if last:
         print(f"figmosha: resuming — {len(done)} unit(s) already done", file=sys.stderr)
+    # `started` as the last word on a unit means it was running when the
+    # previous attempt died. After an out-of-memory crash that is the unit that
+    # filled the tab — or the one that happened to be running when it filled.
+    for i, r in last.items():
+        if r.get("status") == "started":
+            print(f"figmosha: {i} «{r.get('name', '?')}» was running when the previous "
+                  f"attempt ended — running it again", file=sys.stderr)
 
     units, err = _split_ahead(args.node_id, args.split, args.timeout)
     if err is not None:
@@ -2075,6 +2126,7 @@ def cmd_each(args):
 
     def write(rec):
         if state:
+            rec["t"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             state.write(json.dumps(rec, ensure_ascii=False) + "\n")
             state.flush()      # after every unit: the next one may be the crash
 
@@ -2084,7 +2136,16 @@ def cmd_each(args):
             if unit["id"] in done:
                 tally["skipped"] += 1
                 continue
+            prev = last.get(unit["id"])
+            if prev and prev.get("status") == "split" and _kids_from_record(prev):
+                # Already too big once; running it again would overrun again.
+                kids = _kids_from_record(prev)
+                queue = [dict(k, depth=unit["depth"] + 1) for k in kids] + queue
+                continue
 
+            # Before running, not after: if this unit takes the tab down, the
+            # state file is the only place its name survives.
+            write({"id": unit["id"], "name": unit.get("name"), "status": "started"})
             body = prelude([("str", f"ROOT_ID={unit['id']}")]) + extra + code
             t0 = time.monotonic()
             status, resp = _exec(body, args.timeout, want_value=True)
@@ -2092,24 +2153,32 @@ def cmd_each(args):
             ms = int((time.monotonic() - t0) * 1000)
             label = f"{unit['id']} «{unit.get('name', '?')}»"
 
-            if rc == 0:
+            partial = None
+            if rc == 0 and not args.partial_is_ok:
+                partial = _partial_of(resp.get("value"))
+
+            if rc == 0 and partial is None:
                 tally["ok"] += 1
                 print(f"  ok    {label}  {ms}ms", file=sys.stderr)
                 write({"id": unit["id"], "name": unit.get("name"),
                        "status": "ok", "ms": ms, "value": resp.get("value")})
                 continue
 
-            if rc == EXIT_BUSY:
+            if rc == EXIT_BUSY or partial is not None:
                 # Not a retry: the same unit would overrun again, and each
                 # overrun costs the file's thread for minutes. Go smaller.
+                # A script that stopped at its own deadline and said `partial`
+                # is the same unit, caught a moment earlier.
+                why = f"partial ({partial})" if partial is not None else "too slow"
                 if unit["depth"] >= args.max_split:
                     tally["failed"] += 1
                     outcome = EXIT_BUSY
-                    print(f"  FAIL  {label}  too slow, and already split "
+                    print(f"  FAIL  {label}  {why}, and already split "
                           f"{unit['depth']} time(s)", file=sys.stderr)
                     write({"id": unit["id"], "name": unit.get("name"),
-                           "status": "failed", "ms": ms,
-                           "error": resp.get("error")})
+                           "status": "partial" if partial is not None else "failed",
+                           "ms": ms, "error": resp.get("error") or why,
+                           "value": resp.get("value")})
                     continue
                 # Generously, and on purpose. The unit that just overran still
                 # owns the file's thread, so this listing has to wait that out
@@ -2129,15 +2198,18 @@ def cmd_each(args):
                 if not kids:
                     tally["failed"] += 1
                     outcome = EXIT_BUSY
-                    print(f"  FAIL  {label}  too slow, and it has no children to "
+                    print(f"  FAIL  {label}  {why}, and it has no children to "
                           f"split into", file=sys.stderr)
                     write({"id": unit["id"], "name": unit.get("name"),
-                           "status": "failed", "ms": ms, "error": resp.get("error")})
+                           "status": "partial" if partial is not None else "failed",
+                           "ms": ms, "error": resp.get("error") or why,
+                           "value": resp.get("value")})
                     continue
                 tally["split"] += 1
-                print(f"  split {label}  → {len(kids)} child(ren)", file=sys.stderr)
+                print(f"  split {label}  {why} → {len(kids)} child(ren)", file=sys.stderr)
                 write({"id": unit["id"], "name": unit.get("name"),
-                       "status": "split", "ms": ms, "into": [k["id"] for k in kids]})
+                       "status": "split", "ms": ms, "why": why,
+                       "into": [{"id": k["id"], "name": k.get("name")} for k in kids]})
                 # Depth-first: finish this branch before moving on, so a run
                 # that is interrupted has whole subtrees done rather than a
                 # scattering of pieces.
@@ -2308,6 +2380,10 @@ def build_parser():
                              "placements, and they are where a big file's node count is")
     p_find.add_argument("--count", action="store_true",
                         help="just how many, without building the list of matches")
+    p_find.add_argument("--hidden", action="store_true",
+                        help="with --nested, also look at hidden layers inside instances. "
+                             "Off by default: Figma then skips building them, which is "
+                             "most of what a cold walk costs on a heavy file")
 
     p_text = sub.add_parser("text")
     _add_common_flags(p_text)
@@ -2366,6 +2442,9 @@ def build_parser():
                         help="skip units this state file already records as done")
     p_each.add_argument("--keep-going", action="store_true",
                         help="carry on after a script error instead of stopping")
+    p_each.add_argument("--partial-is-ok", action="store_true",
+                        help="record a unit whose result says partial: true as done. "
+                             "By default it is split and run again smaller, like a timeout")
     p_each.add_argument("--max-split", type=int, default=4, metavar="N",
                         help="how many times a unit may be split before it is called "
                              "failed (default 4)")

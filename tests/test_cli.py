@@ -1224,8 +1224,8 @@ def test_each_writes_state_after_every_unit(monkeypatch, tmp_path):
     rc = figmosha.cmd_each(_each_args(tmp_path, state=str(state)))
     assert rc == figmosha.EXIT_SCRIPT
     rows = [json.loads(l) for l in state.read_text(encoding="utf-8").splitlines()]
-    assert [r["status"] for r in rows] == ["ok", "failed"]
-    assert rows[0]["value"] == 7
+    assert [r["status"] for r in rows] == ["started", "ok", "started", "failed"]
+    assert rows[1]["value"] == 7
 
 
 def test_each_resume_skips_what_is_already_done(monkeypatch, tmp_path):
@@ -1243,6 +1243,81 @@ def test_each_resume_skips_what_is_already_done(monkeypatch, tmp_path):
     assert rc == 0
     ran = [c for c in seen if CHILDREN not in c]
     assert len(ran) == 1 and 'const ROOT_ID = "1:2";' in ran[0]
+
+
+def test_each_splits_a_unit_whose_result_says_partial(monkeypatch, tmp_path):
+    """A script that stopped at its own deadline returned normally, but is not done."""
+    def handler(code):
+        if CHILDREN in code:
+            if '"page"' in code:
+                return 200, {"ok": True, "value": [
+                    {"id": "1:1", "name": "Big", "type": "FRAME"}]}
+            return 200, {"ok": True, "value": [
+                {"id": "2:1", "name": "Section", "type": "FRAME"}]}
+        if 'const ROOT_ID = "1:1";' in code:
+            # What a script returning JSON.stringify({...}) looks like on the wire.
+            return 200, {"ok": True, "value": json.dumps(json.dumps(
+                {"partial": True, "reason": "deadline"}))}
+        return 200, {"ok": True, "value": json.dumps({"partial": False})}
+
+    state = tmp_path / "run.jsonl"
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path, state=str(state)))
+    assert rc == 0
+    ran = [c for c in seen if CHILDREN not in c]
+    assert any('const ROOT_ID = "2:1";' in c for c in ran), "its children ran instead"
+    rows = [json.loads(l) for l in state.read_text(encoding="utf-8").splitlines()]
+    last = {r["id"]: r["status"] for r in rows}
+    assert last == {"1:1": "split", "2:1": "ok"}
+
+
+def test_each_partial_is_ok_keeps_the_old_behaviour(monkeypatch, tmp_path):
+    def handler(code):
+        if CHILDREN in code:
+            return 200, {"ok": True, "value": [{"id": "1:1", "name": "A", "type": "FRAME"}]}
+        return 200, {"ok": True, "value": json.dumps({"partial": True})}
+
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path, partial_is_ok=True))
+    assert rc == 0
+    assert len([c for c in seen if CHILDREN not in c]) == 1
+
+
+def test_load_state_takes_the_last_record_per_id(tmp_path):
+    """After a crash and a resume a unit is `started`, `failed`, then `ok`."""
+    state = tmp_path / "run.jsonl"
+    state.write_text("\n".join(json.dumps(r) for r in [
+        {"id": "1:1", "status": "started"},
+        {"id": "1:1", "status": "failed"},
+        {"id": "1:2", "status": "started"},
+        {"id": "1:1", "status": "started"},
+        {"id": "1:1", "status": "ok"},
+    ]) + "\n", encoding="utf-8")
+    last = figmosha._load_state(str(state))
+    assert last["1:1"]["status"] == "ok"
+    assert last["1:2"]["status"] == "started"
+
+
+def test_each_resume_does_not_rerun_a_unit_it_already_split(monkeypatch, tmp_path, capsys):
+    """Running it again would overrun again; its children are the work."""
+    def handler(code):
+        if CHILDREN in code:
+            return 200, {"ok": True, "value": [{"id": "1:1", "name": "Big", "type": "FRAME"}]}
+        return 200, {"ok": True, "value": "done"}
+
+    state = tmp_path / "run.jsonl"
+    state.write_text("\n".join(json.dumps(r) for r in [
+        {"id": "1:1", "status": "split",
+         "into": [{"id": "2:1", "name": "S1"}, {"id": "2:2", "name": "S2"}]},
+        {"id": "2:1", "status": "ok"},
+        {"id": "2:2", "name": "S2", "status": "started"},
+    ]) + "\n", encoding="utf-8")
+    seen = _fake_bridge(monkeypatch, handler)
+    rc = figmosha.cmd_each(_each_args(tmp_path, state=str(state), resume=True))
+    assert rc == 0
+    ran = [c for c in seen if CHILDREN not in c]
+    assert len(ran) == 1 and 'const ROOT_ID = "2:2";' in ran[0]
+    assert "2:2 «S2» was running when the previous attempt ended" in capsys.readouterr().err
 
 
 def test_each_stops_when_the_plugin_is_gone(monkeypatch, tmp_path):

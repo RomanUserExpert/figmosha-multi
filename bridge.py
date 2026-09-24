@@ -58,6 +58,13 @@ ANON_SID = "anon-1"
 MIN_TIMEOUT = 1.0
 MAX_TIMEOUT = 600.0
 
+# A request the plugin has been handed but never said `started` for. The
+# plugin says it before running anything, so past a few seconds this is not a
+# slow script: the tab's main thread is frozen, or the tab is out of memory
+# and on its way down. Seen on 2026-09-24 as "BUSY 0s (dispatched, not
+# started)" on a tab that was already failing.
+STALL_S = 10.0
+
 
 class Session:
     """One plugin instance, in one Figma document."""
@@ -84,6 +91,9 @@ class Session:
         self.pong_waiters: list = []  # futures resolved by the next pong
         self.opened = time.time()
         self.last_seen = time.monotonic()
+        # Whether this plugin says `started` at all. One that predates it would
+        # otherwise look stalled on every request.
+        self.sends_started = False
 
     @property
     def live(self) -> bool:
@@ -121,6 +131,8 @@ class Session:
             d["running_ms"] = int((time.time() - e["t0"]) * 1000)
             d["started"] = e["started_at"] is not None
             d["orphaned"] = e["caller_left_at"] is not None
+            d["stalled"] = (self.sends_started and e["started_at"] is None
+                            and time.time() - e["t0"] >= STALL_S)
         return d
 
 
@@ -440,6 +452,7 @@ def _handle_message(session: Session, m: dict) -> None:
         # The plugin has picked the request up. Until this arrives it is
         # dispatched but not running - which is the difference between "the
         # thread is busy with someone else" and "this script is slow".
+        session.sends_started = True
         run = session.running.get(rid)
         if run is not None and run["started_at"] is None:
             run["started_at"] = time.time()

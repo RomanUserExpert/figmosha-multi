@@ -108,7 +108,7 @@ Rules that follow from how Figma works, not from Figmosha:
 | `figmosha tree <id> [--depth N] [--layout]` | Explore structure. **Depth 3 by default**; a cut branch says `… +N deeper`, and three or more identical siblings collapse into one row (`--no-collapse` to see them all) |
 | `figmosha find <id> name=Button` | Locate by exact name (`name~Btn` = substring) |
 | `figmosha find <id> type=INSTANCE` | Filter by type (also `text=`, `text~`). Prints 100 rows, then says how many were left (`--limit N`). **Does not descend into instances** — `--nested` does; `--count` skips building the list |
-| `figmosha each <id> -f s.js --split 2 --state run.jsonl` | Run one script over a subtree, a unit at a time, writing state as it goes. `--resume` continues an interrupted run. This is how a big file is scanned |
+| `figmosha each <id> -f s.js --split 2 --state run.jsonl` | Run one script over a subtree, a unit at a time, writing state as it goes. `--resume` continues an interrupted run. A result that says `partial: true` is split and run smaller, like a timeout. This is how a big file is scanned |
 | `figmosha sessions [--reset SID]` | Which files are connected and which are `BUSY`. `--reset` only makes the bridge forget — it cannot stop a running script |
 | `figmosha set <id> gap=16 fill=#f5f5f5` | Change literal values — the alternative to a hand-written exec |
 | `figmosha bind <id> gap=space/md fill=surface/bg` | Bind the same keys to variables **by token name** |
@@ -167,7 +167,7 @@ h.variant(inst, props) · h.variantsOf(inst)                          {current, 
 h.sel() · h.resolve(id | "page" | "sel") · h.node(id) · h.var_(idOrKey)
 h.hex("#1a2b3c") · h.solid(hex, opacity?) · h.frame(parent, {layout, spacing, padding, fill, radius, name})
 h.importComp(key, {timeout}) · h.importVar(key, {timeout})   raced against a timer
-h.walk(root, visit, {pruneInstances, budgetMs, maxNodes, maxDepth, maxHits, includeRoot, cursor})
+h.walk(root, visit, {pruneInstances, skipInvisible, budgetMs, maxNodes, maxDepth, maxHits, includeRoot, cursor})
      -> {found, visited, pruned, partial, cursor, reason}   the way to cross a big subtree
 h.mainOf(instance)                                          the only supported route to a component
 h.loadPageOf(node) · h.pages()                              dynamic-page loading, done for you
@@ -251,6 +251,10 @@ not an "is my code working" check.
   bridge forget without stopping anything.
 - **504 `is busy`**: an earlier script whose caller gave up still owns this
   file's thread. Wait for it. Only this file is blocked.
+- **`STALLED` in `figmosha sessions`**: the plugin was handed a request and
+  never said it started. That is not a slow script — the tab is frozen or out
+  of memory. `exec "return 1" -t 15` confirms it; then reopen the file on a
+  light page, re-Run the plugin, `each --resume`.
 - **409 with a list of files**: several files open, no target. Set the session; never guess.
 - **`… permission not specified`**: edit `plugin/manifest.json` here, then ask the
   user to **re-import** (Manage plugins → remove → Import again). A manifest
@@ -294,10 +298,22 @@ real hits were nested inside another instance, so pruning cost nothing and cut
 the walk by orders of magnitude. `figmosha find` and `h.walk` prune by default;
 `--nested` / `pruneInstances: false` looks inside.
 
-**`mainComponent` is the expensive call, not the search.** Resolving one loads
-the backing component — remote library ones included — and nothing releases it.
-Filter on something cheap first, then resolve only the survivors. `h.mainOf`
-counts them and warns through `print()` while the run can still be narrowed.
+**Hidden layers inside instances are skipped.** `h.walk` (and so `find`) turns
+on `figma.skipInvisibleInstanceChildren` while it walks. Measured on 2026-09-24
+on table-heavy screens: a cold section took 3.1–3.7 s without it and 0.2–0.7 s
+with it — building the hidden rows and states was the cost, not the walk.
+`skipInvisible: false` / `find --nested --hidden` when hidden layers are the point.
+
+**What fills the tab is pages and components, and nothing gives it back.**
+Measured the same day, in the tab's own process: loading a heavy page cost
+**+638 MB**; the first `h.mainOf` on six new library components **+264 MB**, and
+the same components again cost nothing. Forty cold sections of a page already
+loaded added about 130 MB in all. Switching to another page releases nothing,
+and neither does anything in the API — only reopening the file does. So the
+budget of one tab is counted in **heavy pages and distinct component keys**, not
+in requests, and a heavy file is several tab sessions: one heavy page per
+session, reopened on a light page in between, `each --resume` across them.
+Filter on something cheap before `h.mainOf` (`variantProperties` costs ms).
 
 **`h.walk` over `findAll`.** `findAll` is synchronous, materialises every match
 as a live node proxy and descends into instances. `h.walk` prunes, checks the
@@ -314,7 +330,10 @@ if (r.partial) print("stopped after " + r.visited + " (" + r.reason + ")");
 running script, so a time limit only exists where the code looks at it.
 
 **Write state after every unit.** Every long run here has been interrupted at
-least once. `each --state` is that, done for you.
+least once. `each --state` is that, done for you. It writes `started` before a
+unit and its outcome after, so a reader takes the **last record per id**; a
+unit whose last record is `started` was running when the tab died, and
+`--resume` names it and runs it again.
 
 **One heavy file open at a time.** Pages, components and images share the tab's
 memory with the document.
